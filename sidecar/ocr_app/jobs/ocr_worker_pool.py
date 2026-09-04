@@ -5,6 +5,7 @@ import asyncio
 import json
 import multiprocessing as mp
 import shutil
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,10 @@ _POISON = None
 
 def worker_processes_enabled() -> bool:
     return max(1, int(settings.ocr_worker_processes)) > 1
+
+
+def _is_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
 
 
 def _blocks_to_json(blocks: list[Any]) -> str:
@@ -567,6 +572,14 @@ class OcrWorkerPool:
 
     async def start(self) -> None:
         desired = max(1, int(settings.ocr_worker_processes))
+        # PyInstaller + multiprocessing.Manager often hangs on Windows; keep
+        # the HTTP server responsive by forcing in-process OCR in frozen builds.
+        if desired > 1 and _is_frozen():
+            logger.warning(
+                "Frozen sidecar: ignoring ocr_worker_processes={} (in-process mode)",
+                desired,
+            )
+            desired = 1
         if desired <= 1:
             self._worker_count = 1
             logger.info("OCR worker pool idle (ocr_worker_processes=1, in-process mode)")
@@ -606,6 +619,8 @@ class OcrWorkerPool:
 
     async def reconfigure(self) -> None:
         desired = max(1, int(settings.ocr_worker_processes))
+        if desired > 1 and _is_frozen():
+            desired = 1
         api_conc = max(1, int(settings.ocr_api_concurrency))
         if self._shared is not None:
             self._shared.reconfigure(api_conc)

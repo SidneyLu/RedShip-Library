@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import sys
 
 import uvicorn
@@ -35,4 +36,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Required for PyInstaller + Windows multiprocessing worker pool.
+    multiprocessing.freeze_support()
     sys.exit(main())

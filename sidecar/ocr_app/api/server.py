@@ -131,16 +131,19 @@ async def startup() -> None:
     bootstrap_from_disk()
     init_engine()
     await create_tables()
+    from loguru import logger
     from ocr_app.jobs.ocr_worker_pool import ocr_worker_pool
     from ocr_app.ocr_core.dashscope_http_pool import install_dashscope_http_pool
 
     await install_dashscope_http_pool()
-    await ocr_worker_pool.start()
+    try:
+        await ocr_worker_pool.start()
+    except Exception as exc:
+        # Never block /health on worker spawn failures (common in frozen builds).
+        logger.exception("OCR worker pool failed to start; falling back to in-process: {}", exc)
     # Heal DB rows left in ocr_running after a crash / restart
     abandoned = await job_manager.abandon(reason="OCR 任务在服务重启后自动清理")
     if abandoned:
-        from loguru import logger
-
         logger.warning("Startup healed {} stuck OCR document(s)", len(abandoned))
 
 
