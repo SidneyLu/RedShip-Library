@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+.prose-sm p {
+  margin: 0.5em 0;
+}
+
+.report-markdown h2 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #9f1239;
+}

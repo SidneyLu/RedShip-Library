@@ -1,0 +1,66 @@
+{
+  "name": "ocr-library-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OCR Library — Electron desktop app with local SQLite library",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build && tsc -p tsconfig.electron.json",
+    "electron:dev": "npm run build:electron && concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "electron:build": "npm run build && electron-builder --win",
+    "sidecar:install": "pip install -r sidecar/requirements.txt",
+    "sidecar:dev": "python sidecar/main.py"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^9.0.1",
+    "react-router-dom": "^7.1.1",
+    "remark-gfm": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.0",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.16",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.redship.ocrlibrary",
+    "productName": "OCR Library",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/ocr-sidecar",
+        "to": "ocr-sidecar",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "OCR-Library-Setup-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
