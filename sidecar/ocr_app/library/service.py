@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ocr_app.config import settings
@@ -23,6 +24,16 @@ from ocr_app.library.paths import (
     sha256_file,
 )
 from ocr_app.ocr_core.vision_pdf import pdf_page_count, render_thumbnail
+
+
+def _delivery_defaults(pdf_path: Path, current: dict | None = None) -> dict:
+    meta = dict(current or {})
+    meta.setdefault("original_filename", pdf_path.name)
+    match = re.search(r"第\s*(\d+)\s*辑", pdf_path.stem)
+    if match and meta.get("volume") is None:
+        meta["volume"] = int(match.group(1))
+    meta.setdefault("proofread", False)
+    return meta
 
 
 def document_to_dict(doc: Document, *, job: OcrJob | None = None) -> dict:
@@ -69,6 +80,22 @@ async def latest_ocr_job(session: AsyncSession, doc_id: str) -> OcrJob | None:
     )
 
 
+async def backfill_delivery_metadata(session: AsyncSession) -> int:
+    """Populate portable source filename/volume defaults for existing libraries."""
+    documents = (await session.scalars(select(Document))).all()
+    changed = 0
+    for doc in documents:
+        meta = parse_metadata(doc.extra_metadata)
+        source = Path(doc.source_path) if doc.source_path else Path(f"{doc.title}.pdf")
+        updated = _delivery_defaults(source, meta)
+        if updated != meta:
+            doc.extra_metadata = metadata_json(updated)
+            changed += 1
+    if changed:
+        await session.commit()
+    return changed
+
+
 async def _jobs_for_running_docs(
     session: AsyncSession, doc_ids: list[str]
 ) -> dict[str, OcrJob]:
@@ -95,29 +122,40 @@ async def list_documents(
     series: str | None = None,
     uncategorized: bool = False,
     sort: str = "updated_at",
-    limit: int = 200,
-) -> list[dict]:
-    stmt = select(Document)
+    limit: int = 20000,
+) -> tuple[list[dict], int]:
+    """Return (items, total) where total is the filtered count before limit."""
+    filters = []
     if status:
-        stmt = stmt.where(Document.status == status)
+        filters.append(Document.status == status)
     if uncategorized:
-        stmt = stmt.where((Document.series.is_(None)) | (Document.series == ""))
+        filters.append((Document.series.is_(None)) | (Document.series == ""))
     elif series:
-        stmt = stmt.where(Document.series == series)
+        filters.append(Document.series == series)
     if q:
         like = f"%{q}%"
-        stmt = stmt.where(Document.title.like(like))
+        filters.append(Document.title.like(like))
+
+    count_stmt = select(func.count()).select_from(Document)
+    stmt = select(Document)
+    for clause in filters:
+        count_stmt = count_stmt.where(clause)
+        stmt = stmt.where(clause)
+
+    total = int((await session.scalar(count_stmt)) or 0)
+
     if sort == "title":
         stmt = stmt.order_by(Document.title)
     elif sort == "created_at":
         stmt = stmt.order_by(Document.created_at.desc())
     else:
         stmt = stmt.order_by(Document.updated_at.desc())
-    stmt = stmt.limit(limit)
+    stmt = stmt.limit(max(1, int(limit)))
     rows = (await session.scalars(stmt)).all()
     running_ids = [d.id for d in rows if d.status == "ocr_running"]
     jobs_map = await _jobs_for_running_docs(session, running_ids)
-    return [document_to_dict(d, job=jobs_map.get(d.id)) for d in rows]
+    items = [document_to_dict(d, job=jobs_map.get(d.id)) for d in rows]
+    return items, total
 
 
 async def get_document(session: AsyncSession, doc_id: str) -> Document | None:
@@ -185,11 +223,13 @@ async def import_pdf(
     resolved_title = (title or pdf_path.stem).strip() or pdf_path.stem
     existing = await session.scalar(select(Document).where(Document.file_sha256 == sha))
     if existing:
+        meta = _delivery_defaults(pdf_path, parse_metadata(existing.extra_metadata))
+        existing.extra_metadata = metadata_json(meta)
         if resolved_title and existing.title != resolved_title:
             existing.title = resolved_title
             existing.source_path = str(pdf_path)
-            await session.commit()
-            await session.refresh(existing)
+        await session.commit()
+        await session.refresh(existing)
         return existing
 
     doc_id = new_id()
@@ -208,6 +248,7 @@ async def import_pdf(
         series=series,
         era=era,
         parser="vision_pdf",
+        extra_metadata=metadata_json(_delivery_defaults(pdf_path)),
     )
     session.add(doc)
     await session.commit()
@@ -298,6 +339,7 @@ async def update_document(
     series: str | None = None,
     era: str | None = None,
     clear_series: bool = False,
+    delivery_metadata: dict | None = None,
 ) -> Document | None:
     doc = await get_document(session, doc_id)
     if not doc:
@@ -319,6 +361,21 @@ async def update_document(
             doc.series = None
     if era is not None:
         doc.era = era
+    if delivery_metadata is not None:
+        meta = parse_metadata(doc.extra_metadata)
+        allowed = {
+            "original_filename",
+            "district",
+            "volume",
+            "pub_year",
+            "pub_org",
+            "proofread",
+            "delivery_notes",
+        }
+        for key, value in delivery_metadata.items():
+            if key in allowed:
+                meta[key] = value
+        doc.extra_metadata = metadata_json(meta)
     await session.commit()
     await session.refresh(doc)
     return doc
@@ -343,6 +400,37 @@ async def mark_document_running(session: AsyncSession, doc: Document, dpi: int) 
     doc.status = "ocr_running"
     doc.dpi = dpi
     doc.error = None
+    await session.commit()
+
+
+async def mark_document_review_running(session: AsyncSession, doc: Document) -> None:
+    doc.status = "review_running"
+    doc.error = None
+    await session.commit()
+
+
+async def mark_document_ocr_done(
+    session: AsyncSession,
+    doc: Document,
+    *,
+    pages: int,
+    block_count: int,
+    vision_model: str,
+) -> None:
+    """OCR finished; awaiting separate review."""
+    doc.pages = pages
+    doc.block_count = block_count
+    doc.vision_model = vision_model
+    doc.status = "ocr_done"
+    doc.error = None
+    doc.extra_metadata = metadata_json(
+        {
+            **parse_metadata(doc.extra_metadata),
+            "vision_model": vision_model,
+            "pages": pages,
+            "block_count": block_count,
+        }
+    )
     await session.commit()
 
 

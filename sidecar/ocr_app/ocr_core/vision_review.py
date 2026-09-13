@@ -7,8 +7,8 @@ from typing import Any
 
 from loguru import logger
 
-from ocr_app.config import settings
-from ocr_app.ocr_core.dashscope_vl import dashscope_client
+from ocr_app.config import active_chat_model, settings
+from ocr_app.ocr_core.vl_client import get_vl_client
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
@@ -65,12 +65,12 @@ async def review_vision_markdown(
         f"--- Markdown 摘录 ---\n{excerpt}"
     )
     try:
-        resp = await dashscope_client.chat(
+        resp = await get_vl_client().chat(
             [
                 {"role": "system", "content": REVIEW_SYSTEM},
                 {"role": "user", "content": user},
             ],
-            model=settings.chat_model,
+            model=active_chat_model(),
         )
         content = ""
         if isinstance(resp, dict):
@@ -94,5 +94,5 @@ async def review_vision_markdown(
         "summary": parsed.get("summary") or "",
         "needs_rerun": needs_rerun,
         "threshold": threshold,
-        "model": settings.chat_model,
+        "model": active_chat_model(),
     }

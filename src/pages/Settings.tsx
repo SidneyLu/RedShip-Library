@@ -10,18 +10,30 @@ import {
 import { OperationProgress } from "@/components/OperationProgress";
 import { useToast } from "@/components/Toast";
 
+const DASHSCOPE_DEFAULT_URL = "https://dashscope.aliyuncs.com/api/v1";
+const OPENAI_DEFAULT_URL = "http://127.0.0.1:8000/v1";
+
+type Provider = "dashscope" | "openai_responses";
+
 export default function SettingsPage() {
   const { showToast } = useToast();
   const [settings, setSettings] = useState<SettingsData | null>(null);
-  const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState("https://dashscope.aliyuncs.com/api/v1");
+  const [provider, setProvider] = useState<Provider>("dashscope");
+  const [dashApiKey, setDashApiKey] = useState("");
+  const [dashBaseUrl, setDashBaseUrl] = useState(DASHSCOPE_DEFAULT_URL);
+  const [openaiApiKey, setOpenaiApiKey] = useState("");
+  const [openaiBaseUrl, setOpenaiBaseUrl] = useState(OPENAI_DEFAULT_URL);
+  const [dashVisionModel, setDashVisionModel] = useState("qwen3.5-flash");
+  const [dashChatModel, setDashChatModel] = useState("qwen3.5-flash");
+  const [openaiVisionModel, setOpenaiVisionModel] = useState("");
+  const [openaiChatModel, setOpenaiChatModel] = useState("");
   const [dpi, setDpi] = useState(300);
-  const [maxPages, setMaxPages] = useState(1000);
-  const [visionModel, setVisionModel] = useState("qwen3.5-flash");
+  const [maxPages, setMaxPages] = useState(10000);
   const [pageConcurrency, setPageConcurrency] = useState(16);
   const [docConcurrency, setDocConcurrency] = useState(8);
   const [apiConcurrency, setApiConcurrency] = useState(128);
   const [workerProcesses, setWorkerProcesses] = useState(1);
+  const [deliverySubmitter, setDeliverySubmitter] = useState("");
   const [dataRoot, setDataRoot] = useState("");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -30,24 +42,45 @@ export default function SettingsPage() {
     null
   );
 
+  const applySettings = (s: SettingsData) => {
+    setSettings(s);
+    const p = (s.llm_provider === "openai_responses" ? "openai_responses" : "dashscope") as Provider;
+    setProvider(p);
+    setDashBaseUrl(s.dashscope_http_api_url || DASHSCOPE_DEFAULT_URL);
+    setOpenaiBaseUrl(s.openai_base_url || OPENAI_DEFAULT_URL);
+    setDashVisionModel(s.vision_model || "qwen3.5-flash");
+    setDashChatModel(s.chat_model || s.vision_model || "qwen3.5-flash");
+    setOpenaiVisionModel(s.openai_vision_model || "");
+    setOpenaiChatModel(s.openai_chat_model || "");
+    setDpi(s.vision_pdf_dpi);
+    setMaxPages(s.vision_pdf_max_pages);
+    setPageConcurrency(s.ocr_page_concurrency);
+    setDocConcurrency(s.ocr_document_concurrency);
+    setApiConcurrency(s.ocr_api_concurrency);
+    setWorkerProcesses(s.ocr_worker_processes ?? 1);
+    setDeliverySubmitter(s.delivery_submitter ?? "");
+    setDataRoot(s.data_root);
+  };
+
   useEffect(() => {
-    getSettings().then((s) => {
-      setSettings(s);
-      setBaseUrl(s.dashscope_http_api_url || "https://dashscope.aliyuncs.com/api/v1");
-      setDpi(s.vision_pdf_dpi);
-      setMaxPages(s.vision_pdf_max_pages);
-      setVisionModel(s.vision_model);
-      setPageConcurrency(s.ocr_page_concurrency);
-      setDocConcurrency(s.ocr_document_concurrency);
-      setApiConcurrency(s.ocr_api_concurrency);
-      setWorkerProcesses(s.ocr_worker_processes ?? 1);
-      setDataRoot(s.data_root);
-    });
+    getSettings().then(applySettings);
   }, []);
 
   const onPickDataRoot = async () => {
     const folder = await window.electronAPI?.openFolder();
     if (folder) setDataRoot(folder);
+  };
+
+  const switchToOpenAI = () => {
+    setProvider("openai_responses");
+    if (!openaiBaseUrl.trim()) setOpenaiBaseUrl(OPENAI_DEFAULT_URL);
+    setMessage("已切换到 OpenAI Responses（保存后生效）");
+  };
+
+  const switchToDashScope = () => {
+    setProvider("dashscope");
+    if (!dashBaseUrl.trim()) setDashBaseUrl(DASHSCOPE_DEFAULT_URL);
+    setMessage("已切换到 DashScope（保存后生效）");
   };
 
   const onSave = async () => {
@@ -59,28 +92,28 @@ export default function SettingsPage() {
         return Math.min(max, Math.max(min, Math.trunc(n)));
       };
       const body: Record<string, unknown> = {
+        llm_provider: provider,
         vision_pdf_dpi: clamp(dpi, 72, 600, 300),
-        vision_pdf_max_pages: clamp(maxPages, 1, 10000, 1000),
-        vision_model: visionModel,
+        vision_pdf_max_pages: clamp(maxPages, 1, 50000, 10000),
+        vision_model: dashVisionModel.trim() || "qwen3.5-flash",
+        chat_model: dashChatModel.trim() || dashVisionModel.trim() || "qwen3.5-flash",
+        openai_vision_model: openaiVisionModel.trim(),
+        openai_chat_model: openaiChatModel.trim(),
         ocr_page_concurrency: clamp(pageConcurrency, 1, 64, 16),
         ocr_document_concurrency: clamp(docConcurrency, 1, 32, 8),
         ocr_api_concurrency: clamp(apiConcurrency, 1, 256, 128),
         ocr_worker_processes: clamp(workerProcesses, 1, 16, 1),
+        delivery_submitter: deliverySubmitter.trim(),
       };
       if (dataRoot) body.data_root = dataRoot;
-      if (baseUrl.trim()) body.dashscope_http_api_url = baseUrl.trim().replace(/\/$/, "");
-      if (apiKey.trim()) body.dashscope_api_key = apiKey.trim();
+      if (dashBaseUrl.trim()) body.dashscope_http_api_url = dashBaseUrl.trim().replace(/\/$/, "");
+      if (openaiBaseUrl.trim()) body.openai_base_url = openaiBaseUrl.trim().replace(/\/$/, "");
+      if (dashApiKey.trim()) body.dashscope_api_key = dashApiKey.trim();
+      if (openaiApiKey.trim()) body.openai_api_key = openaiApiKey.trim();
       const s = await updateSettings(body);
-      setSettings(s);
-      setDpi(s.vision_pdf_dpi);
-      setMaxPages(s.vision_pdf_max_pages);
-      setVisionModel(s.vision_model);
-      setPageConcurrency(s.ocr_page_concurrency);
-      setDocConcurrency(s.ocr_document_concurrency);
-      setApiConcurrency(s.ocr_api_concurrency);
-      setWorkerProcesses(s.ocr_worker_processes ?? 1);
-      setDataRoot(s.data_root);
-      setApiKey("");
+      applySettings(s);
+      setDashApiKey("");
+      setOpenaiApiKey("");
       setMessage("已保存");
       showToast("设置已保存", "success");
     } catch (e) {
@@ -137,6 +170,8 @@ export default function SettingsPage() {
     }
   };
 
+  const isOpenAI = provider === "openai_responses";
+
   return (
     <div className="min-h-screen bg-canvas px-4 py-8">
       <div className="mx-auto max-w-lg rounded-xl border border-border bg-white p-6 shadow-sm">
@@ -168,34 +203,124 @@ export default function SettingsPage() {
             </span>
           </label>
 
-          <label className="block">
-            <span className="text-muted">DashScope API Key {settings?.has_api_key ? "（已配置，留空则不修改）" : ""}</span>
-            <input
-              type="password"
-              className="mt-1 w-full rounded border border-border px-3 py-2"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="sk-..."
-            />
-          </label>
+          <div className="rounded-lg border border-border bg-canvas/60 p-3">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="font-medium text-crimson-800">
+                当前：{isOpenAI ? "OpenAI Responses" : "DashScope"}
+              </span>
+              {isOpenAI ? (
+                <button
+                  type="button"
+                  onClick={switchToDashScope}
+                  className="rounded border border-border px-2.5 py-1 text-xs hover:bg-white"
+                >
+                  切换回 DashScope
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={switchToOpenAI}
+                  className="rounded bg-crimson-700 px-2.5 py-1 text-xs text-white hover:bg-crimson-800"
+                >
+                  一键切到 OpenAI Responses
+                </button>
+              )}
+            </div>
+            <p className="text-xs leading-5 text-muted">
+              Responses 面向本机 vLLM / OpenAI 兼容端点（需视觉模型支持图文）。两侧凭证独立保存，切换不互相覆盖。
+            </p>
+          </div>
 
-          <label className="block">
-            <span className="text-muted">DashScope Base URL</span>
-            <input
-              className="mt-1 w-full rounded border border-border px-3 py-2"
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://dashscope.aliyuncs.com/api/v1"
-            />
-            <span className="mt-1 block text-xs text-muted">
-              默认北京；新加坡可用 https://dashscope-intl.aliyuncs.com/api/v1
-            </span>
-          </label>
-
-          <label className="block">
-            <span className="text-muted">Vision 模型</span>
-            <input className="mt-1 w-full rounded border border-border px-3 py-2" value={visionModel} onChange={(e) => setVisionModel(e.target.value)} />
-          </label>
+          {isOpenAI ? (
+            <>
+              <label className="block">
+                <span className="text-muted">
+                  OpenAI API Key{" "}
+                  {settings?.has_openai_api_key ? "（已配置，留空则不修改；本地可空）" : "（本地 vLLM 可留空）"}
+                </span>
+                <input
+                  type="password"
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={openaiApiKey}
+                  onChange={(e) => setOpenaiApiKey(e.target.value)}
+                  placeholder="EMPTY 或 sk-..."
+                />
+              </label>
+              <label className="block">
+                <span className="text-muted">OpenAI Base URL</span>
+                <input
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={openaiBaseUrl}
+                  onChange={(e) => setOpenaiBaseUrl(e.target.value)}
+                  placeholder={OPENAI_DEFAULT_URL}
+                />
+                <span className="mt-1 block text-xs text-muted">
+                  默认 {OPENAI_DEFAULT_URL}；请求走 /v1/responses
+                </span>
+              </label>
+              <label className="block">
+                <span className="text-muted">Vision 模型（OCR）</span>
+                <input
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={openaiVisionModel}
+                  onChange={(e) => setOpenaiVisionModel(e.target.value)}
+                  placeholder="vLLM 上的视觉模型名"
+                />
+              </label>
+              <label className="block">
+                <span className="text-muted">Chat 模型（质检）</span>
+                <input
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={openaiChatModel}
+                  onChange={(e) => setOpenaiChatModel(e.target.value)}
+                  placeholder="可与 Vision 相同，或另指定文本模型"
+                />
+              </label>
+            </>
+          ) : (
+            <>
+              <label className="block">
+                <span className="text-muted">
+                  DashScope API Key {settings?.has_api_key ? "（已配置，留空则不修改）" : ""}
+                </span>
+                <input
+                  type="password"
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={dashApiKey}
+                  onChange={(e) => setDashApiKey(e.target.value)}
+                  placeholder="sk-..."
+                />
+              </label>
+              <label className="block">
+                <span className="text-muted">DashScope Base URL</span>
+                <input
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={dashBaseUrl}
+                  onChange={(e) => setDashBaseUrl(e.target.value)}
+                  placeholder={DASHSCOPE_DEFAULT_URL}
+                />
+                <span className="mt-1 block text-xs text-muted">
+                  默认北京；新加坡可用 https://dashscope-intl.aliyuncs.com/api/v1
+                </span>
+              </label>
+              <label className="block">
+                <span className="text-muted">Vision 模型（OCR）</span>
+                <input
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={dashVisionModel}
+                  onChange={(e) => setDashVisionModel(e.target.value)}
+                />
+              </label>
+              <label className="block">
+                <span className="text-muted">Chat 模型（质检）</span>
+                <input
+                  className="mt-1 w-full rounded border border-border px-3 py-2"
+                  value={dashChatModel}
+                  onChange={(e) => setDashChatModel(e.target.value)}
+                />
+              </label>
+            </>
+          )}
 
           <label className="block">
             <span className="text-muted">默认 DPI</span>
@@ -205,6 +330,16 @@ export default function SettingsPage() {
           <label className="block">
             <span className="text-muted">单文档最大页数</span>
             <input type="number" className="mt-1 w-full rounded border border-border px-3 py-2" value={maxPages} onChange={(e) => setMaxPages(Number(e.target.value))} />
+          </label>
+
+          <label className="block">
+            <span className="text-muted">甲方交付提交人</span>
+            <input
+              className="mt-1 w-full rounded border border-border px-3 py-2"
+              value={deliverySubmitter}
+              onChange={(e) => setDeliverySubmitter(e.target.value)}
+              placeholder="用于 提交/<姓名>/OCR 与实体目录"
+            />
           </label>
 
           <label className="block">

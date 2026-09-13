@@ -72,10 +72,14 @@ def apply_runtime_config(updates: dict) -> Settings:
 
     key_map = {
         "data_root": "OCR_DATA_ROOT",
+        "llm_provider": "LLM_PROVIDER",
         "dashscope_api_key": "DASHSCOPE_API_KEY",
         "dashscope_http_api_url": "DASHSCOPE_HTTP_API_URL",
+        "openai_base_url": "OPENAI_BASE_URL",
         "vision_model": "VISION_MODEL",
         "chat_model": "CHAT_MODEL",
+        "openai_vision_model": "OPENAI_VISION_MODEL",
+        "openai_chat_model": "OPENAI_CHAT_MODEL",
         "vision_pdf_dpi": "VISION_PDF_DPI",
         "vision_pdf_max_pages": "VISION_PDF_MAX_PAGES",
         "vision_review_threshold": "VISION_REVIEW_THRESHOLD",
@@ -84,6 +88,7 @@ def apply_runtime_config(updates: dict) -> Settings:
         "ocr_document_concurrency": "OCR_DOCUMENT_CONCURRENCY",
         "ocr_api_concurrency": "OCR_API_CONCURRENCY",
         "ocr_worker_processes": "OCR_WORKER_PROCESSES",
+        "delivery_submitter": "DELIVERY_SUBMITTER",
     }
 
     old_root = Path(settings.data_root)
@@ -94,6 +99,10 @@ def apply_runtime_config(updates: dict) -> Settings:
         if k == "dashscope_api_key" and v:
             secrets["dashscope_api_key"] = str(v)
             os.environ["DASHSCOPE_API_KEY"] = str(v)
+        elif k == "openai_api_key" and v is not None:
+            # Allow explicit empty string for local vLLM (Bearer EMPTY).
+            secrets["openai_api_key"] = str(v)
+            os.environ["OPENAI_API_KEY"] = str(v)
         elif k in key_map:
             env = key_map[k]
             if k == "data_root":
@@ -120,11 +129,13 @@ def apply_runtime_config(updates: dict) -> Settings:
     # Always record absolute data_root inside the library folder itself.
     merged["data_root"] = str(new_root.resolve())
 
-    # If switching roots, bring API key along when the destination has none.
+    # If switching roots, bring API keys along when the destination has none.
     if new_root.resolve() != old_root.resolve():
         dest_secrets = _load_secrets_from(new_root)
         if not dest_secrets.get("dashscope_api_key") and secrets.get("dashscope_api_key"):
-            dest_secrets = {**dest_secrets, **secrets}
+            dest_secrets = {**dest_secrets, "dashscope_api_key": secrets["dashscope_api_key"]}
+        if "openai_api_key" not in dest_secrets and "openai_api_key" in secrets:
+            dest_secrets = {**dest_secrets, "openai_api_key": secrets["openai_api_key"]}
         secrets = dest_secrets or secrets
 
     new_root.mkdir(parents=True, exist_ok=True)
@@ -160,28 +171,40 @@ def bootstrap_from_disk() -> None:
         if sec.get("dashscope_api_key"):
             # Prefer library secrets; only fill if unset.
             os.environ.setdefault("DASHSCOPE_API_KEY", sec["dashscope_api_key"])
+        if "openai_api_key" in sec:
+            os.environ.setdefault("OPENAI_API_KEY", str(sec.get("openai_api_key") or ""))
         for k in (
+            "llm_provider",
             "dashscope_http_api_url",
+            "openai_base_url",
             "vision_model",
             "chat_model",
+            "openai_vision_model",
+            "openai_chat_model",
             "vision_pdf_dpi",
             "vision_pdf_max_pages",
             "ocr_page_concurrency",
             "ocr_document_concurrency",
             "ocr_api_concurrency",
             "ocr_worker_processes",
+            "delivery_submitter",
         ):
             if persisted.get(k) is not None:
                 env = {
+                    "llm_provider": "LLM_PROVIDER",
                     "dashscope_http_api_url": "DASHSCOPE_HTTP_API_URL",
+                    "openai_base_url": "OPENAI_BASE_URL",
                     "vision_model": "VISION_MODEL",
                     "chat_model": "CHAT_MODEL",
+                    "openai_vision_model": "OPENAI_VISION_MODEL",
+                    "openai_chat_model": "OPENAI_CHAT_MODEL",
                     "vision_pdf_dpi": "VISION_PDF_DPI",
                     "vision_pdf_max_pages": "VISION_PDF_MAX_PAGES",
                     "ocr_page_concurrency": "OCR_PAGE_CONCURRENCY",
                     "ocr_document_concurrency": "OCR_DOCUMENT_CONCURRENCY",
                     "ocr_api_concurrency": "OCR_API_CONCURRENCY",
                     "ocr_worker_processes": "OCR_WORKER_PROCESSES",
+                    "delivery_submitter": "DELIVERY_SUBMITTER",
                 }[k]
                 if k == "ocr_worker_processes":
                     try:
@@ -209,17 +232,29 @@ def bootstrap_from_disk() -> None:
         # Library secrets override pointer-only secrets when present.
         if second_secrets.get("dashscope_api_key"):
             os.environ["DASHSCOPE_API_KEY"] = str(second_secrets["dashscope_api_key"])
+        if "openai_api_key" in second_secrets:
+            os.environ["OPENAI_API_KEY"] = str(second_secrets.get("openai_api_key") or "")
         _apply(second, secrets=second_secrets or first_secrets)
         get_settings.cache_clear()
 
-    # Migrate API key into the portable library folder when missing there.
+    # Migrate API keys into the portable library folder when missing there.
     resolved_root = Path(get_settings().data_root)
     lib_secrets = _load_secrets_from(resolved_root)
+    changed = False
     if not lib_secrets.get("dashscope_api_key"):
         key = os.environ.get("DASHSCOPE_API_KEY") or first_secrets.get("dashscope_api_key")
         if key:
             lib_secrets = {**lib_secrets, "dashscope_api_key": str(key)}
-            _write_secrets_to(resolved_root, lib_secrets)
+            changed = True
+    if "openai_api_key" not in lib_secrets:
+        okey = os.environ.get("OPENAI_API_KEY")
+        if okey is None and "openai_api_key" in first_secrets:
+            okey = first_secrets.get("openai_api_key")
+        if okey is not None:
+            lib_secrets = {**lib_secrets, "openai_api_key": str(okey)}
+            changed = True
+    if changed:
+        _write_secrets_to(resolved_root, lib_secrets)
 
     # Keep cold-start pointer in sync with the active library.
     if resolved_root.resolve() != pointer_root.resolve():

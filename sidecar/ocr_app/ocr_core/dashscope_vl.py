@@ -21,7 +21,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from ocr_app.config import settings
+from ocr_app.config import active_chat_model, active_vision_model, settings
 from ocr_app.ocr_core.dashscope_http_pool import note_api_success, note_transient_disconnect
 from ocr_app.ocr_core.vl_rate_limiter import vl_limiter
 
@@ -300,7 +300,7 @@ class DashScopeVLClient:
         temperature: float | None = None,
     ) -> dict[str, Any]:
         _ensure_sdk()
-        model_name = model or settings.chat_model
+        model_name = model or active_chat_model()
         kwargs: dict[str, Any] = {
             "messages": messages,
             "result_format": "message",
@@ -375,7 +375,7 @@ class DashScopeVLClient:
             async with vl_limiter.acquire():
                 resp = await AioMultiModalConversation.call(
                     api_key=settings.dashscope_api_key,
-                    model=settings.vision_model,
+                    model=active_vision_model(),
                     messages=messages,
                     request_timeout=_VL_CALL_TIMEOUT_S,
                 )

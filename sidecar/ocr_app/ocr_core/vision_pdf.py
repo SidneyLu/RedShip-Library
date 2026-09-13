@@ -13,6 +13,55 @@ LAYOUT_SCHEMA_VERSION = 1
 _SKIP_RAG_TYPES = {"pagefooter", "pageheader", "footer", "header"}
 
 
+def is_nearly_blank_image(
+    path: Path,
+    *,
+    white_ratio_thresh: float = 0.992,
+    std_thresh: float = 6.0,
+) -> bool:
+    """True when a page image is blank/near-blank (common trailing empty PDF pages).
+
+    Thinking VL models often hang or generate forever on empty pages; callers should
+    skip the VL call and treat the page as empty.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return False
+    try:
+        pix = fitz.Pixmap(str(path))
+        if pix.alpha:
+            pix = fitz.Pixmap(pix, 0)  # drop alpha
+        if pix.n > 1:
+            pix = fitz.Pixmap(fitz.csGRAY, pix)
+        samples = pix.samples
+        n = len(samples)
+        if n == 0:
+            return True
+        # Subsample for speed (~640px long-edge equivalent).
+        stride = max(1, max(pix.width, pix.height) // 640)
+        total = 0
+        total_sq = 0
+        white = 0
+        count = 0
+        for i in range(0, n, stride):
+            v = samples[i]
+            total += v
+            total_sq += v * v
+            if v >= 248:
+                white += 1
+            count += 1
+        mean = total / count
+        var = (total_sq / count) - (mean * mean)
+        std = var ** 0.5 if var > 0 else 0.0
+        if std < std_thresh:
+            return True
+        return (white / count) >= white_ratio_thresh
+    except Exception as exc:
+        logger.warning("blank-detect failed for {}: {}", path, exc)
+        return False
+
+
 @dataclass
 class LayoutBlock:
     type: str
@@ -253,6 +302,8 @@ def merge_page_blocks(
     layout: dict[str, Any],
     page: int,
     new_blocks: list[LayoutBlock],
+    *,
+    force: bool = False,
 ) -> dict[str, Any]:
     pages = layout.get("pages") or []
     entry = {
@@ -265,7 +316,11 @@ def merge_page_blocks(
     out_pages: list[dict[str, Any]] = []
     for p in pages:
         if int(p.get("page", 0)) == page:
-            out_pages.append(entry)
+            # Keep already-recognized pages unless explicitly forced.
+            if not force and page_has_real_content(p.get("blocks") or []):
+                out_pages.append(p)
+            else:
+                out_pages.append(entry)
             replaced = True
         else:
             out_pages.append(p)
@@ -312,6 +367,7 @@ def load_layout_file(path: Path) -> dict[str, Any]:
 PLACEHOLDER_TEXT_MARKERS = (
     "【本页因网络中断未能识别",
     "【本页因云端内容安全审核未能识别",
+    "【本页模型返回空结果未能识别",
 )
 
 
@@ -352,13 +408,20 @@ def pages_to_process(
     explicit_pages: list[int] | None,
     force: bool = False,
 ) -> list[int]:
-    """Return page numbers to OCR. Full runs skip pages already in layout unless force."""
+    """Return page numbers to OCR.
+
+    By default skips pages that already have real content (placeholder-only pages
+    still count as empty). Explicit page lists are filtered the same way unless
+    force=True.
+    """
     if explicit_pages is not None:
-        return sorted(explicit_pages)
+        candidates = sorted({int(p) for p in explicit_pages if int(p) >= 1})
+    else:
+        candidates = list(target_pages)
     if force:
-        return list(target_pages)
+        return candidates
     done = pages_with_content(layout)
-    return [p for p in target_pages if p not in done]
+    return [p for p in candidates if p not in done]
 
 
 def write_artifacts(

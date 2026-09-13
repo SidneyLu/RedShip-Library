@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { OcrProgressBar, type OcrProgressState } from "@/components/OcrProgressBar";
 import { ReviewPanel, type ReviewDoc } from "@/components/ReviewPanel";
+import { DeliveryPanel } from "@/components/DeliveryPanel";
 import { PdfReader } from "@/components/reader/PdfReader";
 import {
   docArtifactUrl,
@@ -11,6 +12,7 @@ import {
   getDocument,
   rerunPages,
   runOcr,
+  runReview,
   stopOcr,
   subscribeJobEvents,
   type DocumentItem,
@@ -30,7 +32,7 @@ type LayoutDoc = {
   pages: Array<{ page: number; blocks: LayoutBlock[] }>;
 };
 
-type ResultTab = "blocks" | "markdown" | "review";
+type ResultTab = "blocks" | "markdown" | "review" | "delivery";
 
 function extractPageMarkdown(md: string, page: number): string {
   const marker = `<!-- page: ${page} -->`;
@@ -211,8 +213,20 @@ export default function WorkbenchPage() {
   const onRunOcr = async () => {
     if (!documentId || ocrBusy) return;
     try {
-      const { job_id } = await runOcr(documentId);
+      const { job_id } = await runOcr(documentId, { auto_review: false });
       watchJob(job_id, "识别中 ");
+      const d = await getDocument(documentId);
+      setDoc(d);
+    } catch (e) {
+      alert(String((e as Error).message || e));
+    }
+  };
+
+  const onRunReview = async () => {
+    if (!documentId || ocrBusy) return;
+    try {
+      const { job_id } = await runReview(documentId);
+      watchJob(job_id, "质检中 ");
       const d = await getDocument(documentId);
       setDoc(d);
     } catch (e) {
@@ -245,7 +259,7 @@ export default function WorkbenchPage() {
       .filter((n) => n > 0);
     if (!pages.length) return;
     try {
-      const { job_id } = await rerunPages(documentId, pages);
+      const { job_id } = await rerunPages(documentId, pages, { force: true });
       watchJob(job_id, `重跑页 ${pages.join(",")} · `);
       const d = await getDocument(documentId);
       setDoc(d);
@@ -303,13 +317,21 @@ export default function WorkbenchPage() {
             >
               {doc?.status === "partial" || doc?.status === "failed" ? "继续 OCR" : "运行 OCR"}
             </button>
-            {ocrBusy || doc?.status === "ocr_running" ? (
+            <button
+              type="button"
+              disabled={ocrBusy}
+              onClick={onRunReview}
+              className="rounded border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-900 hover:bg-sky-100 disabled:opacity-50"
+            >
+              运行质检
+            </button>
+            {ocrBusy || doc?.status === "ocr_running" || doc?.status === "review_running" ? (
               <button
                 type="button"
                 onClick={onStopOcr}
                 className="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 hover:bg-amber-100"
               >
-                停止 OCR
+                停止
               </button>
             ) : null}
             <button
@@ -416,6 +438,13 @@ export default function WorkbenchPage() {
               >
                 质检
               </button>
+              <button
+                type="button"
+                className={cn("rounded-md px-2.5 py-1 text-xs", tab === "delivery" ? "bg-crimson-50 text-crimson-800" : "text-muted")}
+                onClick={() => setTab("delivery")}
+              >
+                甲方交付
+              </button>
             </div>
           </div>
 
@@ -432,7 +461,14 @@ export default function WorkbenchPage() {
               />
             </section>
             <section className="flex min-h-0 w-1/2 min-w-0 flex-col bg-white">
-              {tab === "review" ? (
+              {tab === "delivery" && doc ? (
+                <DeliveryPanel
+                  documentId={documentId}
+                  document={doc}
+                  onGoToPage={goTo}
+                  onDocumentChange={setDoc}
+                />
+              ) : tab === "review" ? (
                 <ReviewPanel review={review} className="min-h-0 flex-1" />
               ) : tab === "markdown" ? (
                 <div className="report-markdown prose-sm min-h-0 flex-1 overflow-auto px-4 py-3">

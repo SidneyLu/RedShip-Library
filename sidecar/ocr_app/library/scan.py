@@ -150,7 +150,7 @@ def infer_status_from_artifacts(
         layout_pages = layout.get("pages") or []
         covered = sum(1 for p in layout_pages if p.get("blocks"))
         if pages > 0 and covered >= pages:
-            status = "ready"
+            status = "ocr_done"
         else:
             status = "partial"
 

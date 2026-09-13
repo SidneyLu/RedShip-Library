@@ -18,7 +18,7 @@ export function ReviewPanel({ review, className }: Props) {
   if (!review) {
     return (
       <div className={cn("p-4 text-sm text-muted", className)}>
-        暂无质检结果。完整 OCR 结束后会由模型自动生成 review。
+        暂无质检结果。OCR 完成后可在图书馆对文档单独或批量运行质检。
       </div>
     );
   }

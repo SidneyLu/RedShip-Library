@@ -60,8 +60,12 @@ test-pdfs/
 tmp/
 temp/
 .tmp/
+.tmp_*/
+.tmp_*.py
+.tmp_*.json
 *.tmp
 ocr_pages_*/
+requirements/
 
 # OS / editor
 .DS_Store

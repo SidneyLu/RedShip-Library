@@ -6,25 +6,27 @@ import shutil
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from ocr_app.config import settings
+from ocr_app.config import active_vision_model, settings
 from ocr_app.db.models import Document, OcrJob
 from ocr_app.library.paths import abs_from_relative, doc_dir
 from ocr_app.library.service import (
     get_document,
+    mark_document_ocr_done,
     mark_document_ready,
     mark_document_running,
 )
 from ocr_app.ocr_core.dashscope_vl import (
     _is_transient_disconnect,
-    dashscope_client,
     is_data_inspection_error,
 )
+from ocr_app.ocr_core.vl_client import get_vl_client
 from ocr_app.ocr_core.vision_pdf import (
     LayoutBlock,
     blocks_to_layout,
@@ -51,6 +53,12 @@ STRICT_HINT = (
 # Keep in sync with PLACEHOLDER_TEXT_MARKERS in vision_pdf.py
 SKIPPED_CONN_NOTE = "【本页因网络中断未能识别，可在工作台对该页单独重跑】"
 SKIPPED_INSPECTION_NOTE = "【本页因云端内容安全审核未能识别，可在工作台对该页单独重跑】"
+SKIPPED_EMPTY_NOTE = "【本页模型返回空结果未能识别，可在工作台对该页单独重跑】"
+
+
+def _is_empty_content_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "empty content" in msg or "returned empty" in msg
 
 PageDoneCallback = Callable[[int, list[LayoutBlock]], Awaitable[None]]
 EmitCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
@@ -93,14 +101,38 @@ async def _resolve_page_image(
 
 async def _ocr_page_blocks(img: Path, page_num: int, *, extra_hint: str | None = None) -> list[LayoutBlock]:
     """OCR one page. DataInspectionFailed → placeholder skip (do not fail the whole job)."""
+    from ocr_app.ocr_core.vision_pdf import is_nearly_blank_image
+
+    # Blank / near-blank pages make thinking VL models hang without useful output.
+    if await asyncio.to_thread(is_nearly_blank_image, img):
+        logger.info("Page {}: nearly blank image — skip VL call", page_num)
+        try:
+            from ocr_app.ocr_core.openai_responses import _record_vl_metric
+            import time as _time
+
+            _record_vl_metric(
+                {
+                    "ts": _time.time(),
+                    "kind": "blank_skip",
+                    "page": page_num,
+                    "image": img.name,
+                    "duration_s": 0.0,
+                    "ok": True,
+                    "error": None,
+                }
+            )
+        except Exception:
+            pass
+        return []
+
     try:
-        raw = await dashscope_client.extract_page_layout(
+        raw = await get_vl_client().extract_page_layout(
             img, page=page_num, extra_hint=extra_hint
         )
         page_blocks = parse_layout_json_text(raw, page_num, repair=True)
         if _blocks_need_strict_retry(page_blocks):
             try:
-                raw2 = await dashscope_client.extract_page_layout(
+                raw2 = await get_vl_client().extract_page_layout(
                     img, page=page_num, extra_hint=(extra_hint or "") + STRICT_HINT
                 )
                 page_blocks = parse_layout_json_text(raw2, page_num, repair=True)
@@ -122,6 +154,13 @@ async def _ocr_page_blocks(img: Path, page_num: int, *, extra_hint: str | None =
                 exc,
             )
             return _skipped_inspection_blocks(page_num)
+        if _is_empty_content_error(exc):
+            logger.warning(
+                "Page {}: empty VL content after retries — skipping page ({})",
+                page_num,
+                exc,
+            )
+            return _skipped_empty_blocks(page_num)
         raise
 
 
@@ -141,6 +180,17 @@ def _skipped_inspection_blocks(page_num: int) -> list[LayoutBlock]:
         LayoutBlock(
             type="text",
             text=SKIPPED_INSPECTION_NOTE,
+            bbox=[60.0, 60.0, 940.0, 120.0],
+            page=page_num,
+        )
+    ]
+
+
+def _skipped_empty_blocks(page_num: int) -> list[LayoutBlock]:
+    return [
+        LayoutBlock(
+            type="text",
+            text=SKIPPED_EMPTY_NOTE,
             bbox=[60.0, 60.0, 940.0, 120.0],
             page=page_num,
         )
@@ -290,6 +340,7 @@ async def _finalize_document(
     pages_total: int,
     pdf_path: Path,
     emit: EmitCallback,
+    auto_review: bool = False,
 ) -> None:
     all_blocks = layout_blocks_from_dict(layout_state)
     layout = blocks_to_layout(all_blocks, pages=int(pages_total) or 1)
@@ -301,22 +352,25 @@ async def _finalize_document(
         if p not in present:
             empty_pages += 1
 
-    review = await review_vision_markdown(
-        markdown,
-        pages=int(pages_total),
-        block_count=len(all_blocks),
-        empty_pages=empty_pages,
-    )
-    if SKIPPED_CONN_NOTE in markdown or SKIPPED_INSPECTION_NOTE in markdown:
-        review["needs_rerun"] = True
-        summary = str(review.get("summary") or "").strip()
-        notes: list[str] = []
-        if SKIPPED_CONN_NOTE in markdown:
-            notes.append("部分页面因网络中断被跳过")
-        if SKIPPED_INSPECTION_NOTE in markdown:
-            notes.append("部分页面因内容安全审核被跳过")
-        note = "；".join(notes)
-        review["summary"] = f"{summary}；{note}" if summary else note
+    review: dict[str, Any] | None = None
+    if auto_review:
+        review = await review_vision_markdown(
+            markdown,
+            pages=int(pages_total),
+            block_count=len(all_blocks),
+            empty_pages=empty_pages,
+        )
+        if SKIPPED_CONN_NOTE in markdown or SKIPPED_INSPECTION_NOTE in markdown:
+            review["needs_rerun"] = True
+            summary = str(review.get("summary") or "").strip()
+            notes: list[str] = []
+            if SKIPPED_CONN_NOTE in markdown:
+                notes.append("部分页面因网络中断被跳过")
+            if SKIPPED_INSPECTION_NOTE in markdown:
+                notes.append("部分页面因内容安全审核被跳过")
+            note = "；".join(notes)
+            review["summary"] = f"{summary}；{note}" if summary else note
+
     write_artifacts(ddir, markdown=markdown, layout=layout, review=review)
 
     try:
@@ -328,17 +382,27 @@ async def _finalize_document(
     job.finished_at = datetime.now(timezone.utc)
     await session.commit()
 
-    await mark_document_ready(
-        session,
-        doc,
-        pages=int(pages_total),
-        block_count=len(all_blocks),
-        review_score=float(review.get("score", 0)),
-        review_summary=str(review.get("summary") or ""),
-        vision_model=settings.vision_model,
-        needs_rerun=bool(review.get("needs_rerun")),
-    )
-    await emit(job_id, {"type": "done", "review": review})
+    if auto_review and review is not None:
+        await mark_document_ready(
+            session,
+            doc,
+            pages=int(pages_total),
+            block_count=len(all_blocks),
+            review_score=float(review.get("score", 0)),
+            review_summary=str(review.get("summary") or ""),
+            vision_model=active_vision_model(),
+            needs_rerun=bool(review.get("needs_rerun")),
+        )
+        await emit(job_id, {"type": "done", "review": review})
+    else:
+        await mark_document_ocr_done(
+            session,
+            doc,
+            pages=int(pages_total),
+            block_count=len(all_blocks),
+            vision_model=active_vision_model(),
+        )
+        await emit(job_id, {"type": "done", "review": None, "status": "ocr_done"})
 
 
 class JobManager:
@@ -346,8 +410,11 @@ class JobManager:
         self._events: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._running: set[str] = set()
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self._doc_sem: asyncio.Semaphore | None = None
-        self._doc_sem_limit = 0
+        # Dynamic document slots: always honor live settings.ocr_document_concurrency
+        # (unlike a fixed Semaphore, which cannot shrink after settings change).
+        self._doc_slot_lock = asyncio.Lock()
+        self._doc_slot_cond = asyncio.Condition(self._doc_slot_lock)
+        self._doc_slots_active = 0
 
     def is_document_running(self, document_id: str) -> bool:
         return document_id in self._running
@@ -366,16 +433,24 @@ class JobManager:
         self._running.discard(document_id)
         self._tasks.pop(document_id, None)
 
-    def _document_semaphore(self) -> asyncio.Semaphore:
-        limit = max(1, int(settings.ocr_document_concurrency))
-        # Never replace a live semaphore (would leak held permits / reset to 1 effectively)
-        if self._doc_sem is None:
-            self._doc_sem = asyncio.Semaphore(limit)
-            self._doc_sem_limit = limit
-        elif self._doc_sem_limit != limit and not self._running:
-            self._doc_sem = asyncio.Semaphore(limit)
-            self._doc_sem_limit = limit
-        return self._doc_sem
+    @asynccontextmanager
+    async def _document_semaphore(self):
+        """Gate concurrent documents using the current settings limit."""
+        while True:
+            async with self._doc_slot_lock:
+                limit = max(1, int(settings.ocr_document_concurrency))
+                if self._doc_slots_active < limit:
+                    self._doc_slots_active += 1
+                    break
+            async with self._doc_slot_cond:
+                await self._doc_slot_cond.wait()
+        try:
+            yield
+        finally:
+            async with self._doc_slot_lock:
+                self._doc_slots_active = max(0, self._doc_slots_active - 1)
+            async with self._doc_slot_cond:
+                self._doc_slot_cond.notify_all()
 
     def subscribe(self, job_id: str) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -399,7 +474,14 @@ class JobManager:
 
         task.add_done_callback(_cleanup)
 
-    async def _mark_abandoned(self, document_id: str, job_id: str | None, reason: str) -> None:
+    async def _mark_abandoned(
+        self,
+        document_id: str,
+        job_id: str | None,
+        reason: str,
+        *,
+        running_status: str = "ocr_running",
+    ) -> None:
         from ocr_app.db.session import get_session_factory
         from ocr_app.library.service import get_document
 
@@ -422,14 +504,18 @@ class JobManager:
                 job.status = "failed"
                 job.error = reason[:2000]
                 job.finished_at = datetime.now(timezone.utc)
-            if doc and doc.status == "ocr_running":
-                layout_path = doc_dir(document_id) / "layout.json"
-                if doc.block_count == 0 and layout_path.is_file():
-                    doc.block_count = len(
-                        layout_blocks_from_dict(load_layout_file(layout_path))
-                    )
-                doc.error = reason[:2000]
-                doc.status = "partial" if doc.block_count > 0 else "failed"
+            if doc and doc.status == running_status:
+                if running_status == "review_running":
+                    doc.error = reason[:2000]
+                    doc.status = "ocr_done"
+                else:
+                    layout_path = doc_dir(document_id) / "layout.json"
+                    if doc.block_count == 0 and layout_path.is_file():
+                        doc.block_count = len(
+                            layout_blocks_from_dict(load_layout_file(layout_path))
+                        )
+                    doc.error = reason[:2000]
+                    doc.status = "partial" if doc.block_count > 0 else "failed"
             await session.commit()
         if job_id:
             await self._emit(job_id, {"type": "error", "error": reason})
@@ -440,20 +526,22 @@ class JobManager:
         *,
         reason: str = "OCR 任务已手动终止（僵死清理）",
     ) -> list[dict[str, Any]]:
-        """Cancel in-flight OCR and/or heal DB rows stuck in ocr_running."""
+        """Cancel in-flight OCR/review and/or heal DB rows stuck in running states."""
         from ocr_app.db.session import get_session_factory
         from sqlalchemy import select
 
         factory = get_session_factory()
         async with factory() as session:
-            q = select(Document).where(Document.status == "ocr_running")
+            q = select(Document).where(
+                Document.status.in_(["ocr_running", "review_running"])
+            )
             if document_ids:
                 q = q.where(Document.id.in_(document_ids))
             rows = list((await session.execute(q)).scalars().all())
-            targets = [d.id for d in rows]
+            targets = [(d.id, d.status) for d in rows]
 
         abandoned: list[dict[str, Any]] = []
-        for doc_id in targets:
+        for doc_id, doc_status in targets:
             from ocr_app.jobs.ocr_worker_pool import (
                 cancel_page_jobs_for_document,
                 ocr_worker_pool,
@@ -473,7 +561,12 @@ class JobManager:
                 except Exception:
                     pass
             else:
-                await self._mark_abandoned(doc_id, job_id, reason)
+                await self._mark_abandoned(
+                    doc_id,
+                    job_id,
+                    reason,
+                    running_status=str(doc_status or "ocr_running"),
+                )
             self._running.discard(doc_id)
             self._tasks.pop(doc_id, None)
             ocr_worker_pool.clear_cancel(doc_id)
@@ -559,6 +652,7 @@ class JobManager:
         max_pages: int | None = None,
         pages: list[int] | None = None,
         force: bool = False,
+        auto_review: bool = False,
     ) -> None:
         # Prefer claim in _start_ocr_job; keep defensive claim for direct callers.
         if document_id not in self._running:
@@ -596,16 +690,24 @@ class JobManager:
 
                     ddir = doc_dir(document_id)
                     layout_path = ddir / "layout.json"
-                    layout_state: dict[str, Any] = {} if force else load_layout_file(layout_path)
+                    # Preserve existing layout except for a forced full-document redo.
+                    layout_state: dict[str, Any] = (
+                        {}
+                        if force and explicit_pages is None
+                        else load_layout_file(layout_path)
+                    )
 
                     pages_list = pages_to_process(
                         target_pages,
                         layout_state,
                         explicit_pages=explicit_pages,
-                        force=force and explicit_pages is None,
+                        force=force,
                     )
 
-                    skipped = len(target_pages) - len(pages_list) if explicit_pages is None else 0
+                    requested_count = (
+                        len(explicit_pages) if explicit_pages is not None else len(target_pages)
+                    )
+                    skipped = max(0, requested_count - len(pages_list))
                     document_total = doc_page_count
                     if skipped > 0:
                         await self._emit(
@@ -635,7 +737,9 @@ class JobManager:
                     async def save_checkpoint(page_num: int, page_blocks: list[LayoutBlock]) -> None:
                         nonlocal layout_state, checkpoint_pages
                         async with checkpoint_lock:
-                            layout_state = merge_page_blocks(layout_state, page_num, page_blocks)
+                            layout_state = merge_page_blocks(
+                                layout_state, page_num, page_blocks, force=force
+                            )
                             blocks = layout_blocks_from_dict(layout_state)
                             markdown = blocks_to_markdown(blocks, title=doc.title)
                             write_artifacts(
@@ -666,6 +770,7 @@ class JobManager:
                             pages_total=pages_total,
                             pdf_path=pdf_path,
                             emit=self._emit,
+                            auto_review=auto_review,
                         )
                         return
 
@@ -739,6 +844,7 @@ class JobManager:
                         pages_total=pages_total,
                         pdf_path=pdf_path,
                         emit=self._emit,
+                        auto_review=auto_review,
                     )
 
         except asyncio.CancelledError:
@@ -766,6 +872,132 @@ class JobManager:
                         )
                     doc.error = str(e)[:2000]
                     doc.status = "partial" if doc.block_count > 0 else "failed"
+                await session.commit()
+            await self._emit(job_id, {"type": "error", "error": str(e)})
+        finally:
+            self.release(document_id)
+
+    async def run_review(
+        self,
+        *,
+        document_id: str,
+        job_id: str,
+    ) -> None:
+        """Run LLM review on existing OCR artifacts (no page VL)."""
+        if document_id not in self._running:
+            self._running.add(document_id)
+        from ocr_app.db.session import get_session_factory
+        from ocr_app.library.service import mark_document_review_running
+
+        factory = get_session_factory()
+        try:
+            async with self._document_semaphore():
+                async with factory() as session:
+                    doc = await get_document(session, document_id)
+                    if not doc:
+                        raise FileNotFoundError(f"document {document_id}")
+                    job = await session.get(OcrJob, job_id)
+                    if not job:
+                        raise FileNotFoundError(f"job {job_id}")
+
+                    ddir = doc_dir(document_id)
+                    layout_path = ddir / "layout.json"
+                    md_path = ddir / "content.md"
+                    if not layout_path.is_file():
+                        raise FileNotFoundError("layout.json not found; run OCR first")
+
+                    layout_state = load_layout_file(layout_path)
+                    all_blocks = layout_blocks_from_dict(layout_state)
+                    if not all_blocks:
+                        raise ValueError("layout has no blocks; run OCR first")
+
+                    if md_path.is_file():
+                        markdown = md_path.read_text(encoding="utf-8")
+                    else:
+                        markdown = blocks_to_markdown(all_blocks, title=doc.title)
+
+                    pages_total = int(doc.pages or 0) or _pages_total(
+                        0, layout_state, all_blocks
+                    )
+                    layout = blocks_to_layout(all_blocks, pages=pages_total or 1)
+                    empty_pages = 0
+                    present = pages_with_content(layout)
+                    for p in range(1, int(pages_total) + 1):
+                        if p not in present:
+                            empty_pages += 1
+
+                    await mark_document_review_running(session, doc)
+                    job.status = "running"
+                    job.current_page = 0
+                    job.total_pages = 1
+                    await session.commit()
+                    await self._emit(
+                        job_id,
+                        {"type": "progress", "current_page": 0, "total_pages": 1},
+                    )
+
+                    review = await review_vision_markdown(
+                        markdown,
+                        pages=int(pages_total) or 1,
+                        block_count=len(all_blocks),
+                        empty_pages=empty_pages,
+                    )
+                    if SKIPPED_CONN_NOTE in markdown or SKIPPED_INSPECTION_NOTE in markdown:
+                        review["needs_rerun"] = True
+                        summary = str(review.get("summary") or "").strip()
+                        notes: list[str] = []
+                        if SKIPPED_CONN_NOTE in markdown:
+                            notes.append("部分页面因网络中断被跳过")
+                        if SKIPPED_INSPECTION_NOTE in markdown:
+                            notes.append("部分页面因内容安全审核被跳过")
+                        note = "；".join(notes)
+                        review["summary"] = f"{summary}；{note}" if summary else note
+
+                    write_artifacts(
+                        ddir,
+                        markdown=markdown,
+                        layout=layout_state if layout_state.get("pages") else layout,
+                        review=review,
+                    )
+
+                    job.status = "done"
+                    job.current_page = 1
+                    job.finished_at = datetime.now(timezone.utc)
+                    await session.commit()
+
+                    await mark_document_ready(
+                        session,
+                        doc,
+                        pages=int(pages_total) or 1,
+                        block_count=len(all_blocks),
+                        review_score=float(review.get("score", 0)),
+                        review_summary=str(review.get("summary") or ""),
+                        vision_model=doc.vision_model or active_vision_model(),
+                        needs_rerun=bool(review.get("needs_rerun")),
+                    )
+                    await self._emit(job_id, {"type": "done", "review": review})
+        except asyncio.CancelledError:
+            logger.warning("Review job cancelled for {}", document_id)
+            await self._mark_abandoned(
+                document_id,
+                job_id,
+                "质检已手动停止",
+                running_status="review_running",
+            )
+            raise
+        except Exception as e:
+            logger.exception("Review job failed: {}", e)
+            async with factory() as session:
+                doc = await get_document(session, document_id)
+                job = await session.get(OcrJob, job_id)
+                if job:
+                    job.status = "failed"
+                    job.error = str(e)[:2000]
+                    job.finished_at = datetime.now(timezone.utc)
+                if doc and doc.status == "review_running":
+                    # Fall back to ocr_done so user can retry review
+                    doc.status = "ocr_done"
+                    doc.error = str(e)[:2000]
                 await session.commit()
             await self._emit(job_id, {"type": "error", "error": str(e)})
         finally:

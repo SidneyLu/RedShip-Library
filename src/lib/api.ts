@@ -23,6 +23,7 @@ export type DocumentItem = {
   era?: string | null;
   dpi?: number | null;
   error?: string | null;
+  extra_metadata?: Record<string, unknown>;
   updated_at?: string | null;
   ocr_job?: {
     id: string;
@@ -35,9 +36,13 @@ export type DocumentItem = {
 
 export type SettingsData = {
   data_root: string;
+  llm_provider?: string;
   dashscope_http_api_url: string;
+  openai_base_url?: string;
   vision_model: string;
   chat_model: string;
+  openai_vision_model?: string;
+  openai_chat_model?: string;
   vision_pdf_dpi: number;
   vision_pdf_max_pages: number;
   vision_review_threshold: number;
@@ -47,6 +52,8 @@ export type SettingsData = {
   ocr_api_concurrency: number;
   ocr_worker_processes?: number;
   has_api_key: boolean;
+  has_openai_api_key?: boolean;
+  delivery_submitter?: string;
 };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -106,7 +113,13 @@ export async function listDocuments(params?: {
 
 export async function updateDocument(
   id: string,
-  body: { title?: string; series?: string; clear_series?: boolean; era?: string }
+  body: {
+    title?: string;
+    series?: string;
+    clear_series?: boolean;
+    era?: string;
+    delivery_metadata?: Record<string, unknown>;
+  }
 ): Promise<DocumentItem> {
   return api(`/library/documents/${id}`, {
     method: "PATCH",
@@ -200,6 +213,7 @@ export async function scanFolder(body?: {
   ocr_pending_in_library?: boolean;
   dpi?: number;
   max_pages?: number;
+  auto_review?: boolean;
 }): Promise<ScanStartResult> {
   return api("/library/scan", {
     method: "POST",
@@ -260,12 +274,40 @@ export async function deleteDocument(id: string): Promise<void> {
 
 export async function runOcr(
   id: string,
-  body?: { dpi?: number; max_pages?: number; pages?: number[]; force?: boolean }
+  body?: { dpi?: number; max_pages?: number; pages?: number[]; force?: boolean; auto_review?: boolean }
 ): Promise<{ job_id: string }> {
   return api(`/library/documents/${id}/ocr`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
+  });
+}
+
+export async function runReview(id: string): Promise<{ job_id: string; document_id: string }> {
+  return api(`/library/documents/${id}/review`, { method: "POST" });
+}
+
+export async function batchOcr(body: {
+  document_ids: string[];
+  dpi?: number;
+  max_pages?: number;
+  auto_review?: boolean;
+  force?: boolean;
+}): Promise<{ jobs: Array<{ job_id: string; document_id: string }>; queued: string[]; skipped: string[]; count: number }> {
+  return api("/library/ocr", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function batchReview(body: {
+  document_ids: string[];
+}): Promise<{ jobs: Array<{ job_id: string; document_id: string }>; queued: string[]; skipped: string[]; count: number }> {
+  return api("/library/review", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 
@@ -310,12 +352,13 @@ export async function stopOcr(
 export async function rerunPages(
   id: string,
   pages: number[],
-  body?: { dpi?: number; max_pages?: number }
+  body?: { dpi?: number; max_pages?: number; force?: boolean; auto_review?: boolean }
 ): Promise<{ job_id: string }> {
   return api(`/library/documents/${id}/rerun-pages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...(body || {}), pages }),
+    // 「重跑页」默认强制覆盖当页已有结果
+    body: JSON.stringify({ force: true, ...(body || {}), pages }),
   });
 }
 
@@ -351,4 +394,90 @@ export function subscribeJobEvents(jobId: string, onEvent: (data: Record<string,
     }
   };
   return es;
+}
+
+export type DeliveryPaper = {
+  title: string;
+  page_start: number;
+  page_end: number;
+  author?: string;
+};
+
+export type DeliveryJob = {
+  id: string;
+  status: "running" | "completed" | "failed";
+  current: number;
+  total: number;
+  current_document_id?: string;
+  results: Array<{
+    document_id: string;
+    ok: boolean;
+    papers?: number;
+    unmapped?: number;
+    error?: string;
+  }>;
+  report_path?: string;
+  error?: string;
+};
+
+export async function getDelivery(id: string): Promise<{
+  document: DocumentItem;
+  papers: DeliveryPaper[];
+  entities?: Record<string, unknown> | null;
+  ocr_validation: { errors: string[]; warnings: string[] };
+}> {
+  return api(`/library/documents/${id}/delivery`);
+}
+
+export async function saveDeliveryPapers(id: string, papers: DeliveryPaper[]) {
+  return api<{ document_id: string; papers: DeliveryPaper[] }>(
+    `/library/documents/${id}/papers`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ papers }),
+    }
+  );
+}
+
+export async function processWenshi(body: {
+  document_ids: string[];
+  split_papers?: boolean;
+  extract_entities?: boolean;
+  use_model?: boolean;
+  export?: boolean;
+  submitter?: string;
+  output_root?: string;
+}): Promise<{ job_id: string; total: number }> {
+  return api("/library/process/wenshi", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function getDeliveryJob(jobId: string): Promise<DeliveryJob> {
+  return api(`/delivery-jobs/${jobId}`);
+}
+
+export async function exportWenshi(body: {
+  document_ids: string[];
+  submitter?: string;
+  output_root?: string;
+}): Promise<{
+  results: Array<{
+    document_id: string;
+    ocr_path?: string;
+    entity_path?: string | null;
+    errors: string[];
+    warnings?: string[];
+  }>;
+  success_count: number;
+  failure_count: number;
+}> {
+  return api("/library/export/wenshi", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }

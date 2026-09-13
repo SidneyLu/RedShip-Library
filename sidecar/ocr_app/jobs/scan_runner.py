@@ -45,6 +45,7 @@ class ScanJobManager:
         dpi: int | None,
         max_pages: int | None,
         queue_ocr_fn,
+        auto_review: bool = False,
     ) -> None:
         if scan_job_id in self._running:
             return
@@ -128,7 +129,11 @@ class ScanJobManager:
                         ).all()
                         ocr_targets.extend(rows)
                     jobs, skipped = await queue_ocr_fn(
-                        session, ocr_targets, dpi=dpi, max_pages=max_pages
+                        session,
+                        ocr_targets,
+                        dpi=dpi,
+                        max_pages=max_pages,
+                        auto_review=auto_review,
                     )
                     queued_ocr = [j["document_id"] for j in jobs]
                     skipped_ocr = skipped

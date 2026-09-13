@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  batchOcr,
+  batchReview,
   createFolder,
   deleteDocument,
   deleteFolder,
@@ -9,8 +11,11 @@ import {
   listDocuments,
   listFolders,
   moveDocuments,
+  processWenshi,
+  getDeliveryJob,
   renameFolder,
   runOcr,
+  runReview,
   stopOcr,
   scanFolder,
   subscribeScanEvents,
@@ -26,6 +31,8 @@ import { cn } from "@/lib/utils";
 const STATUS_LABEL: Record<string, string> = {
   pending: "待 OCR",
   ocr_running: "识别中",
+  ocr_done: "待质检",
+  review_running: "质检中",
   ready: "已完成",
   failed: "失败",
   partial: "部分完成",
@@ -65,6 +72,7 @@ export default function LibraryPage() {
   const [scanRecursive, setScanRecursive] = useState(false);
   const [scanRunOcr, setScanRunOcr] = useState(true);
   const [scanOcrPending, setScanOcrPending] = useState(false);
+  const [scanAutoReview, setScanAutoReview] = useState(false);
   const [scanFolderPath, setScanFolderPath] = useState<string | null>(null);
   const [operation, setOperation] = useState<{ current: number; total: number; label: string } | null>(
     null
@@ -181,6 +189,7 @@ export default function LibraryPage() {
         recursive: scanRecursive,
         run_ocr: scanRunOcr,
         ocr_pending_in_library: scanOcrPending,
+        auto_review: scanAutoReview,
       });
       setBusy(false);
 
@@ -220,8 +229,8 @@ export default function LibraryPage() {
   const onReOcr = async (id: string) => {
     setOcrStarting((prev) => new Set(prev).add(id));
     try {
-      await runOcr(id);
-      showToast("OCR 已启动", "success");
+      await runOcr(id, { auto_review: false });
+      showToast("OCR 已启动（不含质检）", "success");
       await refresh(true);
     } catch (e) {
       showToast(String((e as Error).message || e), "error");
@@ -234,8 +243,100 @@ export default function LibraryPage() {
     }
   };
 
+  const onRunReview = async (id: string) => {
+    setOcrStarting((prev) => new Set(prev).add(id));
+    try {
+      await runReview(id);
+      showToast("质检已启动", "success");
+      await refresh(true);
+    } catch (e) {
+      showToast(String((e as Error).message || e), "error");
+    } finally {
+      setOcrStarting((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  const onBulkOcr = async () => {
+    if (selected.size === 0) return;
+    setBusy(true);
+    try {
+      const res = await batchOcr({
+        document_ids: [...selected],
+        auto_review: false,
+      });
+      showToast(
+        `已排队 OCR ${res.count} 项` + (res.skipped.length ? ` · 跳过 ${res.skipped.length}` : ""),
+        "success"
+      );
+      await refresh(true);
+    } catch (e) {
+      showToast(String((e as Error).message || e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onBulkReview = async () => {
+    if (selected.size === 0) return;
+    setBusy(true);
+    try {
+      const res = await batchReview({ document_ids: [...selected] });
+      showToast(
+        `已排队质检 ${res.count} 项` + (res.skipped.length ? ` · 跳过 ${res.skipped.length}` : ""),
+        "success"
+      );
+      await refresh(true);
+    } catch (e) {
+      showToast(String((e as Error).message || e), "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onBulkDelivery = async () => {
+    if (selected.size === 0) return;
+    setBusy(true);
+    try {
+      const started = await processWenshi({
+        document_ids: [...selected],
+        split_papers: true,
+        extract_entities: true,
+        use_model: true,
+        export: true,
+      });
+      setOperation({ current: 0, total: started.total, label: "正在生成甲方交付数据…" });
+      while (true) {
+        const job = await getDeliveryJob(started.job_id);
+        setOperation({
+          current: job.current,
+          total: job.total,
+          label: `篇目/实体/导出 ${job.current}/${job.total}`,
+        });
+        if (job.status !== "running") {
+          const success = job.results.filter((item) => item.ok).length;
+          const failed = job.results.length - success;
+          showToast(
+            `交付处理完成 ${success}/${job.total}${failed ? ` · 失败 ${failed}` : ""}`,
+            failed ? "error" : "success"
+          );
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    } catch (e) {
+      showToast(String((e as Error).message || e), "error");
+    } finally {
+      setBusy(false);
+      setOperation(null);
+    }
+  };
+
   const onStopOcr = async (id: string, title: string) => {
-    if (!confirm(`停止「${title}」的 OCR？已完成的页面会保留。`)) return;
+    if (!confirm(`停止「${title}」的进行中任务？已完成的页面会保留。`)) return;
     try {
       await stopOcr(id);
       showToast("OCR 已停止", "info");
@@ -424,8 +525,10 @@ export default function LibraryPage() {
           >
             <option value="">全部状态</option>
             <option value="ready">已完成</option>
+            <option value="ocr_done">待质检</option>
             <option value="pending">待 OCR</option>
             <option value="ocr_running">识别中</option>
+            <option value="review_running">质检中</option>
             <option value="needs_rerun">需重跑</option>
             <option value="partial">部分完成</option>
             <option value="failed">失败</option>
@@ -555,6 +658,30 @@ export default function LibraryPage() {
                 </select>
                 <button
                   type="button"
+                  disabled={selected.size === 0 || busy}
+                  onClick={onBulkOcr}
+                  className="rounded border border-border px-2.5 py-1 text-xs hover:bg-crimson-50 disabled:opacity-50"
+                >
+                  批量 OCR
+                </button>
+                <button
+                  type="button"
+                  disabled={selected.size === 0 || busy}
+                  onClick={onBulkReview}
+                  className="rounded border border-border px-2.5 py-1 text-xs hover:bg-crimson-50 disabled:opacity-50"
+                >
+                  批量质检
+                </button>
+                <button
+                  type="button"
+                  disabled={selected.size === 0 || busy}
+                  onClick={onBulkDelivery}
+                  className="rounded border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-xs text-emerald-900 hover:bg-emerald-100 disabled:opacity-50"
+                >
+                  生成甲方交付包
+                </button>
+                <button
+                  type="button"
                   disabled={selected.size === 0}
                   onClick={onBulkMove}
                   className="rounded bg-crimson-700 px-2.5 py-1 text-xs text-white hover:bg-crimson-800 disabled:opacity-50"
@@ -637,11 +764,13 @@ export default function LibraryPage() {
                             "shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium",
                             doc.status === "ready"
                               ? "bg-emerald-50 text-emerald-800"
-                              : doc.status === "failed"
-                                ? "bg-red-50 text-red-700"
-                                : doc.status === "partial"
-                                  ? "bg-orange-50 text-orange-800"
-                                  : "bg-amber-50 text-amber-900"
+                              : doc.status === "ocr_done"
+                                ? "bg-sky-50 text-sky-800"
+                                : doc.status === "failed"
+                                  ? "bg-red-50 text-red-700"
+                                  : doc.status === "partial"
+                                    ? "bg-orange-50 text-orange-800"
+                                    : "bg-amber-50 text-amber-900"
                           )}
                         >
                           {STATUS_LABEL[doc.status] || doc.status}
@@ -692,17 +821,39 @@ export default function LibraryPage() {
                           >
                             停止 OCR
                           </button>
-                        ) : (
+                        ) : doc.status === "review_running" ? (
                           <button
                             type="button"
-                            disabled={ocrStarting.has(doc.id)}
-                            onClick={() => onReOcr(doc.id)}
-                            className="rounded border border-border px-2.5 py-1 text-xs hover:bg-crimson-50 disabled:opacity-50"
+                            onClick={() => onStopOcr(doc.id, doc.title)}
+                            className="rounded border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs text-amber-900 hover:bg-amber-100"
                           >
-                            {doc.status === "partial" || doc.status === "failed"
-                              ? "继续 OCR"
-                              : "重新 OCR"}
+                            停止质检
                           </button>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              disabled={ocrStarting.has(doc.id)}
+                              onClick={() => onReOcr(doc.id)}
+                              className="rounded border border-border px-2.5 py-1 text-xs hover:bg-crimson-50 disabled:opacity-50"
+                            >
+                              {doc.status === "partial" || doc.status === "failed"
+                                ? "继续 OCR"
+                                : "重新 OCR"}
+                            </button>
+                            {(doc.status === "ocr_done" ||
+                              doc.status === "needs_rerun" ||
+                              doc.status === "ready") && (
+                              <button
+                                type="button"
+                                disabled={ocrStarting.has(doc.id)}
+                                onClick={() => onRunReview(doc.id)}
+                                className="rounded border border-sky-300 bg-sky-50 px-2.5 py-1 text-xs text-sky-900 hover:bg-sky-100 disabled:opacity-50"
+                              >
+                                质检
+                              </button>
+                            )}
+                          </>
                         )}
                         <button
                           type="button"
@@ -817,6 +968,15 @@ export default function LibraryPage() {
                   onChange={(e) => setScanOcrPending(e.target.checked)}
                 />
                 同时 OCR 库内待处理文档（pending / partial / failed）
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={scanAutoReview}
+                  onChange={(e) => setScanAutoReview(e.target.checked)}
+                  disabled={!scanRunOcr && !scanOcrPending}
+                />
+                OCR 后自动质检（默认关，可稍后批量质检）
               </label>
             </div>
             <div className="mt-5 flex justify-end gap-2">
