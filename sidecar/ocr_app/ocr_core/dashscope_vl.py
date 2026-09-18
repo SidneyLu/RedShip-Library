@@ -15,7 +15,6 @@ from dashscope import AioGeneration, AioMultiModalConversation
 from loguru import logger
 from tenacity import (
     AsyncRetrying,
-    before_sleep_log,
     retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
@@ -200,12 +199,25 @@ async def _retry_call(
     attempts: int,
     label: str,
 ) -> Any:
+    def _before_sleep(retry_state) -> None:
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        # loguru treats {} as format fields — escape exception text.
+        msg = str(exc or "").replace("{", "{{").replace("}", "}}")
+        logger.warning(
+            "{} retry {}/{} after {:.1f}s: {}",
+            label,
+            retry_state.attempt_number,
+            attempts,
+            float(getattr(retry_state.next_action, "sleep", 0) or 0),
+            msg[:300],
+        )
+
     async for attempt in AsyncRetrying(
         stop=stop_after_attempt(attempts),
         # Higher min backoff reduces reconnect stampedes after disconnects.
         wait=wait_random_exponential(multiplier=2.0, min=6, max=90),
         retry=retry_if_exception(_is_retryable),
-        before_sleep=before_sleep_log(logger, "WARNING"),
+        before_sleep=_before_sleep,
         reraise=True,
     ):
         with attempt:

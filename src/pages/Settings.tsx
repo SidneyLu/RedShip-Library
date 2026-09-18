@@ -99,9 +99,9 @@ export default function SettingsPage() {
         chat_model: dashChatModel.trim() || dashVisionModel.trim() || "qwen3.5-flash",
         openai_vision_model: openaiVisionModel.trim(),
         openai_chat_model: openaiChatModel.trim(),
-        ocr_page_concurrency: clamp(pageConcurrency, 1, 64, 16),
-        ocr_document_concurrency: clamp(docConcurrency, 1, 32, 8),
-        ocr_api_concurrency: clamp(apiConcurrency, 1, 256, 128),
+        ocr_page_concurrency: clamp(pageConcurrency, 1, 256, 16),
+        ocr_document_concurrency: clamp(docConcurrency, 1, 64, 8),
+        ocr_api_concurrency: clamp(apiConcurrency, 1, 2048, 128),
         ocr_worker_processes: clamp(workerProcesses, 1, 16, 1),
         delivery_submitter: deliverySubmitter.trim(),
       };
@@ -344,32 +344,34 @@ export default function SettingsPage() {
 
           <label className="block">
             <span className="text-muted">单文档页级并发（同时 OCR 的页数）</span>
-            <input type="number" min={1} max={32} className="mt-1 w-full rounded border border-border px-3 py-2" value={pageConcurrency} onChange={(e) => setPageConcurrency(Number(e.target.value))} />
+            <input type="number" min={1} max={256} className="mt-1 w-full rounded border border-border px-3 py-2" value={pageConcurrency} onChange={(e) => setPageConcurrency(Number(e.target.value))} />
           </label>
 
           <label className="block">
             <span className="text-muted">多文档并发（同时 OCR 的 PDF 数量）</span>
-            <input type="number" min={1} max={16} className="mt-1 w-full rounded border border-border px-3 py-2" value={docConcurrency} onChange={(e) => setDocConcurrency(Number(e.target.value))} />
+            <input type="number" min={1} max={64} className="mt-1 w-full rounded border border-border px-3 py-2" value={docConcurrency} onChange={(e) => setDocConcurrency(Number(e.target.value))} />
           </label>
 
           <label className="block">
             <span className="text-muted">全局 API 并发上限（遇 429 自动降速）</span>
-            <input type="number" min={1} max={128} className="mt-1 w-full rounded border border-border px-3 py-2" value={apiConcurrency} onChange={(e) => setApiConcurrency(Number(e.target.value))} />
-            <span className="mt-1 block text-xs text-muted">当前页级×文档=128；遇 429 会自动降速</span>
+            <input type="number" min={1} max={2048} className="mt-1 w-full rounded border border-border px-3 py-2" value={apiConcurrency} onChange={(e) => setApiConcurrency(Number(e.target.value))} />
+            <span className="mt-1 block text-xs text-muted">
+              冲配额时提高此值（可至 2048）；有效在途仍受页级×文档与云端 RPM/TPM 约束，遇 429 会自动降速
+            </span>
           </label>
 
           <label className="block">
-            <span className="text-muted">OCR Worker 进程数（1=进程内；2–4=多进程池）</span>
+            <span className="text-muted">OCR Worker 进程数（1=进程内；2+=多进程池）</span>
             <input
               type="number"
               min={1}
-              max={8}
+              max={16}
               className="mt-1 w-full rounded border border-border px-3 py-2"
               value={workerProcesses}
               onChange={(e) => setWorkerProcesses(Number(e.target.value))}
             />
             <span className="mt-1 block text-xs text-muted">
-              大于 1 时 API 进程只调度页任务，Worker 负责渲染与 VL；全局 API 并发仍受上方上限约束
+              大于 1 时 API 进程只调度页任务，Worker 负责渲染与 VL；全局 API 并发仍受上方上限约束。16 vCPU 建议 4–8
             </span>
           </label>
 

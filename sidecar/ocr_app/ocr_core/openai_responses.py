@@ -14,7 +14,6 @@ import httpx
 from loguru import logger
 from tenacity import (
     AsyncRetrying,
-    before_sleep_log,
     retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
@@ -38,8 +37,9 @@ def vl_call_metrics_snapshot(limit: int = 100) -> list[dict[str, Any]]:
 
 
 def _metrics_path() -> Path:
-    root = Path(getattr(settings, "data_root", None) or ".")
-    return root / "vl_call_metrics.jsonl"
+    from ocr_app.library.paths import logs_dir
+
+    return logs_dir() / "vl_call_metrics.jsonl"
 
 
 def _record_vl_metric(event: dict[str, Any]) -> None:
@@ -114,6 +114,16 @@ def _auth_header() -> str:
     return f"Bearer {key}"
 
 
+def _use_chat_completions() -> bool:
+    """Chat Completions for Aliyun compatible-mode and local llama-cpp-python."""
+    base = _base_url().lower()
+    return (
+        "compatible-mode" in base
+        or "127.0.0.1" in base
+        or "localhost" in base
+    )
+
+
 def _extract_output_text(data: dict[str, Any]) -> str:
     """Pull assistant text from a Responses API payload."""
     if isinstance(data.get("output_text"), str) and data["output_text"].strip():
@@ -167,11 +177,23 @@ async def _retry_call(
     attempts: int,
     label: str,
 ) -> Any:
+    def _before_sleep(retry_state) -> None:
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        msg = str(exc or "").replace("{", "{{").replace("}", "}}")
+        logger.warning(
+            "{} retry {}/{} after {:.1f}s: {}",
+            label,
+            retry_state.attempt_number,
+            attempts,
+            float(getattr(retry_state.next_action, "sleep", 0) or 0),
+            msg[:300],
+        )
+
     async for attempt in AsyncRetrying(
         stop=stop_after_attempt(attempts),
         wait=wait_random_exponential(multiplier=2.0, min=6, max=90),
         retry=retry_if_exception(_is_retryable),
-        before_sleep=before_sleep_log(logger, "WARNING"),
+        before_sleep=_before_sleep,
         reraise=True,
     ):
         with attempt:
@@ -181,8 +203,8 @@ async def _retry_call(
 
 
 class OpenAIResponsesClient:
-    async def _post_responses(self, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
-        url = f"{_base_url()}/responses"
+    async def _post_json(self, path: str, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
+        url = f"{_base_url()}{path}"
         headers = {
             "Authorization": _auth_header(),
             "Content-Type": "application/json",
@@ -208,13 +230,21 @@ class OpenAIResponsesClient:
             except Exception:
                 pass
             raise OpenAIResponsesAPIError(
-                f"responses failed: status={resp.status_code} {detail}",
+                f"{path} failed: status={resp.status_code} {detail}",
                 status_code=resp.status_code,
             )
         data = resp.json()
         if not isinstance(data, dict):
-            raise OpenAIResponsesAPIError("responses returned non-object JSON")
+            raise OpenAIResponsesAPIError(f"{path} returned non-object JSON")
         return data
+
+    async def _post_responses(self, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
+        return await self._post_json("/responses", payload, timeout_s=timeout_s)
+
+    async def _post_chat_completions(
+        self, payload: dict[str, Any], *, timeout_s: float
+    ) -> dict[str, Any]:
+        return await self._post_json("/chat/completions", payload, timeout_s=timeout_s)
 
     async def chat(
         self,
@@ -224,6 +254,61 @@ class OpenAIResponsesClient:
         temperature: float | None = None,
     ) -> dict[str, Any]:
         model_name = model or active_chat_model()
+
+        if _use_chat_completions():
+            chat_messages: list[dict[str, Any]] = []
+            for msg in messages:
+                role = str(msg.get("role") or "user")
+                content = msg.get("content")
+                text = content if isinstance(content, str) else str(content or "")
+                chat_messages.append({"role": role, "content": text})
+            payload: dict[str, Any] = {
+                "model": model_name,
+                "messages": chat_messages,
+            }
+            if "compatible-mode" in _base_url().lower():
+                payload["enable_thinking"] = False
+            if temperature is not None:
+                payload["temperature"] = temperature
+
+            async def _do_chat_cc() -> dict[str, Any]:
+                t0 = time.perf_counter()
+                ok = True
+                err = None
+                try:
+                    async with vl_limiter.acquire():
+                        data = await self._post_chat_completions(
+                            payload, timeout_s=_CHAT_CALL_TIMEOUT_S
+                        )
+                    text = _extract_output_text(data)
+                    return {
+                        "choices": [
+                            {"index": 0, "message": {"role": "assistant", "content": text}}
+                        ],
+                    }
+                except Exception as exc:
+                    ok = False
+                    err = str(exc)[:240]
+                    raise
+                finally:
+                    _record_vl_metric(
+                        {
+                            "ts": time.time(),
+                            "kind": "chat",
+                            "model": model_name,
+                            "duration_s": round(time.perf_counter() - t0, 3),
+                            "ok": ok,
+                            "error": err,
+                        }
+                    )
+
+            return await _retry_call(
+                _do_chat_cc,
+                timeout_s=_CHAT_CALL_TIMEOUT_S,
+                attempts=6,
+                label="openai_chat.chat",
+            )
+
         instructions = ""
         input_items: list[dict[str, Any]] = []
         for msg in messages:
@@ -250,7 +335,7 @@ class OpenAIResponsesClient:
             ]
             instructions = ""
 
-        payload: dict[str, Any] = {
+        payload = {
             "model": model_name,
             "input": input_items,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -327,6 +412,65 @@ class OpenAIResponsesClient:
         )
         if extra_hint:
             prompt = prompt + str(extra_hint)
+
+        if _use_chat_completions():
+            cc_payload: dict[str, Any] = {
+                "model": active_vision_model(),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": image_ref}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+            }
+            if "compatible-mode" in _base_url().lower():
+                cc_payload["enable_thinking"] = False
+
+            async def _do_cc() -> str:
+                t0 = time.perf_counter()
+                ok = True
+                err = None
+                out_chars = 0
+                try:
+                    async with vl_limiter.acquire():
+                        data = await self._post_chat_completions(
+                            cc_payload, timeout_s=_VL_CALL_TIMEOUT_S
+                        )
+                    text = _extract_output_text(data)
+                    if not text:
+                        raise OpenAIResponsesAPIError(
+                            "extract_page_layout returned empty content"
+                        )
+                    out_chars = len(text)
+                    return text
+                except Exception as exc:
+                    ok = False
+                    err = str(exc)[:240]
+                    raise
+                finally:
+                    _record_vl_metric(
+                        {
+                            "ts": time.time(),
+                            "kind": "vision_ocr",
+                            "model": active_vision_model(),
+                            "page": page,
+                            "image": p.name,
+                            "duration_s": round(time.perf_counter() - t0, 3),
+                            "out_chars": out_chars,
+                            "ok": ok,
+                            "error": err,
+                        }
+                    )
+
+            return await _retry_call(
+                _do_cc,
+                timeout_s=_VL_CALL_TIMEOUT_S,
+                attempts=6,
+                label=f"openai_chat.extract_page_layout page={page}",
+            )
 
         payload: dict[str, Any] = {
             "model": active_vision_model(),

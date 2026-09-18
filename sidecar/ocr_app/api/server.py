@@ -242,7 +242,9 @@ async def vl_metrics(limit: int = 100) -> dict[str, Any]:
 
     items = vl_call_metrics_snapshot(limit=max(1, min(500, int(limit or 100))))
     # Also merge recent disk log (covers worker-process writes).
-    path = Path(settings.data_root) / "vl_call_metrics.jsonl"
+    from ocr_app.library.paths import logs_dir
+
+    path = logs_dir() / "vl_call_metrics.jsonl"
     disk: list[dict[str, Any]] = []
     if path.is_file():
         try:
@@ -475,6 +477,7 @@ async def _queue_ocr_jobs(
     dpi: int | None,
     max_pages: int | None,
     auto_review: bool = False,
+    force: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Start OCR for doc_ids; skip running/already-queued conflicts."""
     jobs: list[dict[str, Any]] = []
@@ -494,6 +497,7 @@ async def _queue_ocr_jobs(
                 dpi=dpi,
                 max_pages=max_pages,
                 pages=None,
+                force=force,
                 auto_review=auto_review,
             )
             jobs.append(job_info)
@@ -797,7 +801,9 @@ async def _run_delivery_job(job_id: str, body: DeliveryProcessBody) -> None:
             "success_count": sum(1 for item in results if item.get("ok")),
             "failure_count": sum(1 for item in results if not item.get("ok")),
         }
-        report_path = Path(settings.data_root) / "wenshi_batch_report.json"
+        from ocr_app.library.paths import reports_dir
+
+        report_path = reports_dir() / "wenshi_batch_report.json"
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -973,6 +979,7 @@ async def api_batch_ocr(
         dpi=body.dpi,
         max_pages=body.max_pages,
         auto_review=body.auto_review,
+        force=body.force,
     )
     return {
         "jobs": jobs,

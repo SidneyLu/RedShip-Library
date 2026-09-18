@@ -12,6 +12,11 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // AutoDL / container hosts often cannot raise inotify limits (ENOSPC).
+    watch: {
+      usePolling: true,
+      interval: 1000,
+    },
   },
   build: {
     outDir: "dist",

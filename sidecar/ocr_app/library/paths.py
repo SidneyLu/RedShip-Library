@@ -9,6 +9,20 @@ from pathlib import Path
 from ocr_app.config import settings
 
 
+def _subdir(name: str) -> Path:
+    path = settings.data_root / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def logs_dir() -> Path:
+    return _subdir("logs")
+
+
+def reports_dir() -> Path:
+    return _subdir("reports")
+
+
 def doc_dir(document_id: str) -> Path:
     return settings.data_root / "docs" / document_id
 
