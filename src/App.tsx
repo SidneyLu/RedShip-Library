@@ -1,6 +1,7 @@
 import { Link, Route, Routes } from "react-router-dom";
 import { ToastProvider } from "./components/Toast";
 import LibraryPage from "./pages/Library";
+import SearchPage from "./pages/Search";
 import SettingsPage from "./pages/Settings";
 import WorkbenchPage from "./pages/Workbench";
 
@@ -9,6 +10,7 @@ export default function App() {
     <ToastProvider>
       <Routes>
         <Route path="/" element={<LibraryPage />} />
+        <Route path="/search" element={<SearchPage />} />
         <Route path="/workbench/:documentId" element={<WorkbenchPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route

@@ -374,6 +374,13 @@ async def _finalize_document(
     write_artifacts(ddir, markdown=markdown, layout=layout, review=review)
 
     try:
+        from ocr_app.library.search_index import upsert_document
+
+        await upsert_document(session, doc.id, title=doc.title, series=doc.series)
+    except Exception:
+        pass
+
+    try:
         await asyncio.to_thread(render_thumbnail, pdf_path, ddir / "thumb.png")
     except Exception:
         pass
@@ -959,6 +966,15 @@ class JobManager:
                         layout=layout_state if layout_state.get("pages") else layout,
                         review=review,
                     )
+
+                    try:
+                        from ocr_app.library.search_index import upsert_document
+
+                        await upsert_document(
+                            session, doc.id, title=doc.title, series=doc.series
+                        )
+                    except Exception:
+                        pass
 
                     job.status = "done"
                     job.current_page = 1

@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   getSettings,
+  getSearchIndexStatus,
   mergeExternalDocs,
   reindexLibrary,
+  startSearchReindex,
   updateSettings,
   type SettingsData,
 } from "@/lib/api";
@@ -160,6 +162,40 @@ export default function SettingsPage() {
           : "");
       setMessage(msg);
       showToast(msg, "success");
+    } catch (e) {
+      const msg = String((e as Error).message || e);
+      setMessage(msg);
+      showToast(msg, "error");
+    } finally {
+      setLibraryBusy(false);
+      setOperation(null);
+    }
+  };
+
+  const onSearchReindex = async () => {
+    setLibraryBusy(true);
+    setMessage(null);
+    setOperation({ current: 0, total: 0, label: "正在重建全文检索索引…" });
+    try {
+      await startSearchReindex(true);
+      for (let i = 0; i < 600; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const s = await getSearchIndexStatus();
+        setOperation({
+          current: s.reindex.current,
+          total: Math.max(1, s.reindex.total),
+          label: `全文索引 ${s.reindex.current}/${s.reindex.total}（已索引 ${s.reindex.indexed}）`,
+        });
+        if (s.reindex.status === "done") {
+          const msg = `全文索引完成：${s.reindex.indexed} 本 · ${s.index_rows} 页行 · 跳过 ${s.reindex.skipped}`;
+          setMessage(msg);
+          showToast(msg, "success");
+          break;
+        }
+        if (s.reindex.status === "error") {
+          throw new Error(s.reindex.error || "重建失败");
+        }
+      }
     } catch (e) {
       const msg = String((e as Error).message || e);
       setMessage(msg);
@@ -403,6 +439,14 @@ export default function SettingsPage() {
                 className="rounded-lg border border-border py-2 hover:bg-crimson-50 disabled:opacity-50"
               >
                 合并外部 docs 文件夹
+              </button>
+              <button
+                type="button"
+                disabled={libraryBusy}
+                onClick={onSearchReindex}
+                className="rounded-lg border border-border py-2 hover:bg-crimson-50 disabled:opacity-50"
+              >
+                重建全文检索索引
               </button>
             </div>
           </div>

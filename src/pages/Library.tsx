@@ -537,6 +537,12 @@ export default function LibraryPage() {
             >
               扫描文件夹
             </button>
+            <Link
+              to="/search"
+              className="rounded-lg border border-border px-3 py-1.5 text-sm hover:bg-crimson-50"
+            >
+              全文检索
+            </Link>
             <Link to="/settings" className="rounded-lg border border-border px-3 py-1.5 text-sm hover:bg-crimson-50">
               设置
             </Link>

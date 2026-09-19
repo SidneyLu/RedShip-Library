@@ -186,8 +186,10 @@ def _document_filters(
     elif series:
         filters.append(Document.series == series)
     if q:
-        like = f"%{q}%"
-        filters.append(Document.title.like(like))
+        # Escape LIKE wildcards so user input is literal.
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{escaped}%"
+        filters.append(Document.title.like(like, escape="\\"))
     return filters
 
 
@@ -422,6 +424,13 @@ async def import_existing_artifacts(
         doc.status = updates["status"]
     doc.source_path = source_path or str(pdf_path)
     await session.commit()
+    try:
+        from ocr_app.library.search_index import upsert_document
+
+        await upsert_document(session, doc.id, title=doc.title, series=doc.series)
+        await session.commit()
+    except Exception:
+        pass
     return doc.id
 
 
@@ -471,6 +480,14 @@ async def update_document(
                 meta[key] = value
         doc.extra_metadata = metadata_json(meta)
     await session.commit()
+    if title is not None or clear_series or series is not None:
+        try:
+            from ocr_app.library.search_index import upsert_document
+
+            await upsert_document(session, doc.id, title=doc.title, series=doc.series)
+            await session.commit()
+        except Exception:
+            pass
     await session.refresh(doc)
     return doc
 
@@ -479,6 +496,12 @@ async def delete_document(session: AsyncSession, doc_id: str) -> bool:
     doc = await get_document(session, doc_id)
     if not doc:
         return False
+    try:
+        from ocr_app.library.search_index import delete_document_fts
+
+        await delete_document_fts(session, doc_id)
+    except Exception:
+        pass
     await session.delete(doc)
     await session.commit()
     await asyncio.to_thread(remove_doc_tree, doc_id)

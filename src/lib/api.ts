@@ -269,6 +269,66 @@ export async function reindexLibrary(): Promise<ReindexReport> {
   return api("/library/reindex", { method: "POST" });
 }
 
+export type SearchHit = {
+  document_id: string;
+  title: string;
+  series?: string | null;
+  status: string;
+  page: number;
+  snippet: string;
+};
+
+export type SearchResponse = {
+  items: SearchHit[];
+  total: number;
+  q: string;
+  limit?: number;
+  offset?: number;
+  index_rows?: number;
+  hint?: string;
+};
+
+export type SearchIndexStatus = {
+  index_rows: number;
+  reindex: {
+    status: string;
+    current: number;
+    total: number;
+    indexed: number;
+    skipped: number;
+    error?: string | null;
+    started_at?: string | null;
+    finished_at?: string | null;
+  };
+};
+
+export async function searchLibrary(params: {
+  q: string;
+  status?: string;
+  series?: string;
+  uncategorized?: boolean;
+  limit?: number;
+  offset?: number;
+}): Promise<SearchResponse> {
+  const qs = new URLSearchParams();
+  qs.set("q", params.q);
+  if (params.status) qs.set("status", params.status);
+  if (params.series) qs.set("series", params.series);
+  if (params.uncategorized) qs.set("uncategorized", "true");
+  if (params.limit != null) qs.set("limit", String(params.limit));
+  if (params.offset != null) qs.set("offset", String(params.offset));
+  return api(`/library/search?${qs.toString()}`);
+}
+
+export async function getSearchIndexStatus(): Promise<SearchIndexStatus> {
+  return api("/library/search/status");
+}
+
+export async function startSearchReindex(force = false): Promise<SearchIndexStatus["reindex"]> {
+  const qs = force ? "?force=true" : "";
+  return api(`/library/search/reindex${qs}`, { method: "POST" });
+}
+
 export type MergeDocsReport = {
   copied: string[];
   skipped_same: string[];

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { OcrProgressBar, type OcrProgressState } from "@/components/OcrProgressBar";
@@ -43,6 +43,31 @@ function extractPageMarkdown(md: string, page: number): string {
   return (next < 0 ? md.slice(after) : md.slice(after, next)).trim();
 }
 
+function highlightText(text: string, query: string): ReactNode {
+  const q = query.trim();
+  if (!q || !text) return text;
+  const lower = text.toLowerCase();
+  const needle = q.toLowerCase();
+  const nodes: ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+  while (i < text.length) {
+    const at = lower.indexOf(needle, i);
+    if (at < 0) {
+      nodes.push(text.slice(i));
+      break;
+    }
+    if (at > i) nodes.push(text.slice(i, at));
+    nodes.push(
+      <mark key={key++} className="rounded bg-amber-100 px-0.5 text-amber-950">
+        {text.slice(at, at + q.length)}
+      </mark>
+    );
+    i = at + q.length;
+  }
+  return nodes;
+}
+
 function progressFromDoc(d: DocumentItem): OcrProgressState | null {
   if (d.status !== "ocr_running") return null;
   const job = d.ocr_job;
@@ -57,20 +82,24 @@ function progressFromDoc(d: DocumentItem): OcrProgressState | null {
 
 export default function WorkbenchPage() {
   const { documentId } = useParams<{ documentId: string }>();
+  const [searchParams] = useSearchParams();
+  const highlightQ = (searchParams.get("q") || "").trim();
   const [doc, setDoc] = useState<DocumentItem | null>(null);
   const [layout, setLayout] = useState<LayoutDoc | null>(null);
   const [markdown, setMarkdown] = useState("");
   const [review, setReview] = useState<ReviewDoc | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [page, setPage] = useState(1);
-  const [pageInput, setPageInput] = useState("1");
+  const initialPage = Math.max(1, parseInt(searchParams.get("page") || "1", 10) || 1);
+  const [page, setPage] = useState(initialPage);
+  const [pageInput, setPageInput] = useState(String(initialPage));
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
-  const [tab, setTab] = useState<ResultTab>("blocks");
+  const [tab, setTab] = useState<ResultTab>(highlightQ ? "markdown" : "blocks");
   const [progress, setProgress] = useState<OcrProgressState | null>(null);
   const [ocrBusy, setOcrBusy] = useState(false);
   const blockRefs = useRef<Map<number, HTMLLIElement>>(new Map());
   const esRef = useRef<EventSource | null>(null);
+  const appliedQueryPage = useRef(false);
 
   const loadArtifacts = useCallback(async () => {
     if (!documentId) return;
@@ -98,6 +127,20 @@ export default function WorkbenchPage() {
   useEffect(() => {
     loadArtifacts();
   }, [loadArtifacts]);
+
+  useEffect(() => {
+    if (appliedQueryPage.current) return;
+    const raw = searchParams.get("page");
+    if (!raw) return;
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < 1) return;
+    const max = layout?.pages?.length || doc?.pages || 0;
+    if (max <= 0) return;
+    const capped = Math.min(n, max);
+    setPage(capped);
+    setPageInput(String(capped));
+    appliedQueryPage.current = true;
+  }, [searchParams, layout, doc?.pages]);
 
   useEffect(() => {
     return () => {
@@ -472,7 +515,13 @@ export default function WorkbenchPage() {
                 <ReviewPanel review={review} className="min-h-0 flex-1" />
               ) : tab === "markdown" ? (
                 <div className="report-markdown prose-sm min-h-0 flex-1 overflow-auto px-4 py-3">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{pageMarkdown}</ReactMarkdown>
+                  {highlightQ ? (
+                    <pre className="whitespace-pre-wrap font-sans text-sm leading-6 text-ink">
+                      {highlightText(pageMarkdown, highlightQ)}
+                    </pre>
+                  ) : (
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{pageMarkdown}</ReactMarkdown>
+                  )}
                 </div>
               ) : (
                 <ul className="min-h-0 flex-1 space-y-2 overflow-auto p-3">
@@ -482,6 +531,9 @@ export default function WorkbenchPage() {
                     currentBlocks.map((b, i) => {
                       const color = ocrBlockColor(b.type);
                       const active = activeIdx === i;
+                      const matched = Boolean(
+                        highlightQ && b.text.toLowerCase().includes(highlightQ.toLowerCase())
+                      );
                       return (
                         <li
                           key={`${page}-${i}`}
@@ -494,13 +546,19 @@ export default function WorkbenchPage() {
                             onClick={() => setActiveIdx(i)}
                             className={cn(
                               "flex w-full gap-2 rounded-xl border px-3 py-2 text-left transition",
-                              active ? "border-crimson-400 bg-crimson-50/80" : "border-border bg-canvas/50 hover:border-crimson-200"
+                              active
+                                ? "border-crimson-400 bg-crimson-50/80"
+                                : matched
+                                  ? "border-amber-300 bg-amber-50/60"
+                                  : "border-border bg-canvas/50 hover:border-crimson-200"
                             )}
                           >
                             <span className="mt-0.5 w-1 shrink-0 self-stretch rounded-full" style={{ backgroundColor: color.bar }} />
                             <span className="min-w-0 flex-1">
                               <span className={cn("mb-1 block text-[10px] font-semibold uppercase", color.label)}>{b.type}</span>
-                              <span className="block whitespace-pre-wrap text-sm leading-6">{b.text}</span>
+                              <span className="block whitespace-pre-wrap text-sm leading-6">
+                                {highlightText(b.text, highlightQ)}
+                              </span>
                             </span>
                           </button>
                         </li>

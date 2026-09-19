@@ -202,6 +202,12 @@ async def startup() -> None:
     abandoned = await job_manager.abandon(reason="OCR 任务在服务重启后自动清理")
     if abandoned:
         logger.warning("Startup healed {} stuck OCR document(s)", len(abandoned))
+    try:
+        from ocr_app.library.search_index import maybe_auto_reindex_on_startup
+
+        asyncio.create_task(maybe_auto_reindex_on_startup())
+    except Exception as exc:
+        logger.warning("FTS auto-reindex schedule failed: {}", exc)
 
 
 @app.on_event("shutdown")
@@ -393,6 +399,75 @@ async def api_list_document_ids(
         sort=sort,
     )
     return {"ids": ids, "total": total}
+
+
+@app.get("/library/search")
+async def api_library_search(
+    session: AsyncSession = Depends(get_session),
+    q: str = "",
+    status: str | None = None,
+    series: str | None = None,
+    uncategorized: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    from ocr_app.library.search_index import (
+        fts_row_count,
+        sanitize_fts_query,
+        search_documents,
+    )
+
+    cleaned = sanitize_fts_query(q)
+    if not cleaned:
+        return {
+            "items": [],
+            "total": 0,
+            "q": q,
+            "index_rows": await fts_row_count(session),
+            "hint": "请输入检索词",
+        }
+    if len(cleaned) < 3:
+        return {
+            "items": [],
+            "total": 0,
+            "q": cleaned,
+            "index_rows": await fts_row_count(session),
+            "hint": "全文检索至少需要 3 个字符（trigram）",
+        }
+    items, total = await search_documents(
+        session,
+        q=cleaned,
+        status=status,
+        series=series,
+        uncategorized=uncategorized,
+        limit=max(1, min(int(limit), 200)),
+        offset=max(0, int(offset)),
+    )
+    return {
+        "items": items,
+        "total": total,
+        "q": cleaned,
+        "limit": limit,
+        "offset": offset,
+        "index_rows": await fts_row_count(session),
+    }
+
+
+@app.get("/library/search/status")
+async def api_search_index_status(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    from ocr_app.library.search_index import fts_row_count, get_reindex_status
+
+    return {
+        "index_rows": await fts_row_count(session),
+        "reindex": get_reindex_status(),
+    }
+
+
+@app.post("/library/search/reindex")
+async def api_search_reindex(force: bool = False) -> dict[str, Any]:
+    from ocr_app.library.search_index import start_rebuild_background
+
+    return start_rebuild_background(force=force)
 
 
 @app.get("/library/folders")

@@ -90,6 +90,20 @@ async def create_tables() -> None:
                 "ON documents (series, updated_at)"
             )
         )
+        await conn.execute(
+            text(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS doc_fts USING fts5(
+                  document_id UNINDEXED,
+                  page UNINDEXED,
+                  title,
+                  series,
+                  body,
+                  tokenize='trigram'
+                )
+                """
+            )
+        )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
