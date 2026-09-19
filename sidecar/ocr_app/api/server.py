@@ -43,6 +43,7 @@ from ocr_app.library.service import (
     get_document,
     get_document_dict,
     import_pdf,
+    list_document_ids,
     list_documents,
     update_document,
 )
@@ -359,6 +360,7 @@ async def api_list_documents(
     uncategorized: bool = False,
     sort: str = "updated_at",
     limit: int = 20000,
+    offset: int = 0,
 ) -> dict[str, Any]:
     items, total = await list_documents(
         session,
@@ -368,8 +370,29 @@ async def api_list_documents(
         uncategorized=uncategorized,
         sort=sort,
         limit=max(1, min(int(limit), 100000)),
+        offset=max(0, int(offset)),
     )
-    return {"items": items, "total": total}
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get("/library/documents/ids")
+async def api_list_document_ids(
+    session: AsyncSession = Depends(get_session),
+    q: str | None = None,
+    status: str | None = None,
+    series: str | None = None,
+    uncategorized: bool = False,
+    sort: str = "updated_at",
+) -> dict[str, Any]:
+    ids, total = await list_document_ids(
+        session,
+        q=q,
+        status=status,
+        series=series,
+        uncategorized=uncategorized,
+        sort=sort,
+    )
+    return {"ids": ids, "total": total}
 
 
 @app.get("/library/folders")
@@ -728,7 +751,11 @@ async def api_thumb(doc_id: str) -> FileResponse:
     p = artifact_path(doc_id, "thumb.png")
     if not p:
         raise HTTPException(404, "thumb not found")
-    return FileResponse(p, media_type="image/png")
+    return FileResponse(
+        p,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/library/documents/{doc_id}/source.pdf")

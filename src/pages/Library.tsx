@@ -9,6 +9,7 @@ import {
   docThumbUrl,
   importPdf,
   listDocuments,
+  listDocumentIds,
   listFolders,
   moveDocuments,
   processWenshi,
@@ -27,6 +28,8 @@ import { OperationProgress } from "@/components/OperationProgress";
 import { useToast } from "@/components/Toast";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { cn } from "@/lib/utils";
+
+const PAGE_SIZE = 48;
 
 const STATUS_LABEL: Record<string, string> = {
   pending: "待 OCR",
@@ -79,7 +82,18 @@ export default function LibraryPage() {
   );
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
+  const [page, setPage] = useState(1);
+  const [filteredTotal, setFilteredTotal] = useState(0);
   const scanEsRef = useRef<EventSource | null>(null);
+  const hasLoadedRef = useRef(false);
+  const filtersRef = useRef({ debouncedQ, status, folderFilter });
+
+  const listFilter = {
+    q: debouncedQ || undefined,
+    status: status || undefined,
+    series: typeof folderFilter === "string" && folderFilter ? folderFilter : undefined,
+    uncategorized: folderFilter === "",
+  };
 
   const refreshFolders = useCallback(async () => {
     try {
@@ -98,16 +112,16 @@ export default function LibraryPage() {
       setError(null);
       try {
         const res = await listDocuments({
-          q: debouncedQ || undefined,
-          status: status || undefined,
-          series: typeof folderFilter === "string" && folderFilter ? folderFilter : undefined,
-          uncategorized: folderFilter === "",
+          ...listFilter,
+          limit: PAGE_SIZE,
+          offset: (page - 1) * PAGE_SIZE,
         });
         setItems(res.items);
-        setSelected((prev) => {
-          const ids = new Set(res.items.map((d) => d.id));
-          return new Set([...prev].filter((id) => ids.has(id)));
-        });
+        setFilteredTotal(res.total);
+        const pageCount = Math.max(1, Math.ceil(res.total / PAGE_SIZE));
+        if (page > pageCount) {
+          setPage(pageCount);
+        }
         await refreshFolders();
       } catch (e) {
         setError(String((e as Error).message || e));
@@ -115,12 +129,26 @@ export default function LibraryPage() {
         if (!silent) setLoading(false);
       }
     },
-    [debouncedQ, status, folderFilter, refreshFolders]
+    [debouncedQ, status, folderFilter, page, refreshFolders]
   );
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    const prev = filtersRef.current;
+    if (
+      prev.debouncedQ !== debouncedQ ||
+      prev.status !== status ||
+      prev.folderFilter !== folderFilter
+    ) {
+      filtersRef.current = { debouncedQ, status, folderFilter };
+      setSelected(new Set());
+      if (page !== 1) {
+        setPage(1);
+        return;
+      }
+    }
+    void refresh(hasLoadedRef.current);
+    hasLoadedRef.current = true;
+  }, [debouncedQ, status, folderFilter, page, refresh]);
 
   useEffect(() => {
     return () => {
@@ -394,7 +422,21 @@ export default function LibraryPage() {
   };
 
   const selectAllVisible = () => {
-    setSelected(new Set(items.map((d) => d.id)));
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const d of items) next.add(d.id);
+      return next;
+    });
+  };
+
+  const selectAllFiltered = async () => {
+    try {
+      const res = await listDocumentIds(listFilter);
+      setSelected(new Set(res.ids));
+      showToast(`已选中筛选结果 ${res.ids.length} 项`, "info");
+    } catch (e) {
+      showToast(String((e as Error).message || e), "error");
+    }
   };
 
   const clearSelection = () => setSelected(new Set());
@@ -633,12 +675,21 @@ export default function LibraryPage() {
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm text-muted">
               当前：<span className="font-medium text-ink">{folderLabel}</span>
-              {items.length > 0 ? ` · ${items.length} 项` : ""}
+              {filteredTotal > 0
+                ? ` · ${filteredTotal} 项${
+                    filteredTotal > PAGE_SIZE
+                      ? ` · 第 ${page}/${Math.max(1, Math.ceil(filteredTotal / PAGE_SIZE))} 页`
+                      : ""
+                  }`
+                : ""}
             </p>
             {selectMode ? (
               <div className="flex flex-wrap items-center gap-2 text-sm">
                 <button type="button" onClick={selectAllVisible} className="text-crimson-700 hover:underline">
-                  全选当前
+                  全选本页
+                </button>
+                <button type="button" onClick={selectAllFiltered} className="text-crimson-700 hover:underline">
+                  全选筛选结果
                 </button>
                 <button type="button" onClick={clearSelection} className="text-muted hover:underline">
                   清空
@@ -729,6 +780,7 @@ export default function LibraryPage() {
                         src={docThumbUrl(doc.id)}
                         alt=""
                         loading="lazy"
+                        decoding="async"
                         className="relative h-full w-full object-cover object-top"
                         onError={(e) => {
                           (e.target as HTMLImageElement).style.display = "none";
@@ -869,6 +921,47 @@ export default function LibraryPage() {
               })}
             </div>
           )}
+          {filteredTotal > PAGE_SIZE ? (
+            <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-sm">
+              <button
+                type="button"
+                disabled={page <= 1 || loading}
+                onClick={() => setPage(1)}
+                className="rounded border border-border px-2.5 py-1 hover:bg-crimson-50 disabled:opacity-40"
+              >
+                首页
+              </button>
+              <button
+                type="button"
+                disabled={page <= 1 || loading}
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                className="rounded border border-border px-2.5 py-1 hover:bg-crimson-50 disabled:opacity-40"
+              >
+                上一页
+              </button>
+              <span className="px-2 text-muted">
+                {page} / {Math.max(1, Math.ceil(filteredTotal / PAGE_SIZE))}
+              </span>
+              <button
+                type="button"
+                disabled={page >= Math.ceil(filteredTotal / PAGE_SIZE) || loading}
+                onClick={() =>
+                  setPage((p) => Math.min(Math.ceil(filteredTotal / PAGE_SIZE), p + 1))
+                }
+                className="rounded border border-border px-2.5 py-1 hover:bg-crimson-50 disabled:opacity-40"
+              >
+                下一页
+              </button>
+              <button
+                type="button"
+                disabled={page >= Math.ceil(filteredTotal / PAGE_SIZE) || loading}
+                onClick={() => setPage(Math.max(1, Math.ceil(filteredTotal / PAGE_SIZE)))}
+                className="rounded border border-border px-2.5 py-1 hover:bg-crimson-50 disabled:opacity-40"
+              >
+                末页
+              </button>
+            </div>
+          ) : null}
         </main>
       </div>
 

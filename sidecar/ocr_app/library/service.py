@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from ocr_app.config import settings
 from ocr_app.db.models import Document, OcrJob
@@ -71,6 +72,35 @@ def document_to_dict(doc: Document, *, job: OcrJob | None = None) -> dict:
     return data
 
 
+def document_to_list_dict(doc: Document, *, job: OcrJob | None = None) -> dict:
+    """Lean payload for the library grid — skip metadata blobs and long errors."""
+    error = doc.error
+    if error and len(error) > 240:
+        error = error[:237] + "..."
+    data: dict = {
+        "id": doc.id,
+        "title": doc.title,
+        "pages": doc.pages,
+        "block_count": doc.block_count,
+        "review_score": doc.review_score,
+        "review_summary": doc.review_summary,
+        "status": doc.status,
+        "series": doc.series,
+        "error": error,
+        "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+        "ocr_job": None,
+    }
+    if job is not None:
+        data["ocr_job"] = {
+            "id": job.id,
+            "status": job.status,
+            "current_page": job.current_page,
+            "total_pages": job.total_pages,
+            "error": job.error,
+        }
+    return data
+
+
 async def latest_ocr_job(session: AsyncSession, doc_id: str) -> OcrJob | None:
     return await session.scalar(
         select(OcrJob)
@@ -81,8 +111,20 @@ async def latest_ocr_job(session: AsyncSession, doc_id: str) -> OcrJob | None:
 
 
 async def backfill_delivery_metadata(session: AsyncSession) -> int:
-    """Populate portable source filename/volume defaults for existing libraries."""
-    documents = (await session.scalars(select(Document))).all()
+    """Populate portable source filename/volume defaults for existing libraries.
+
+    Skip rows that already have original_filename so startup does not scan the
+    whole catalog on a large library.
+    """
+    documents = (
+        await session.scalars(
+            select(Document).where(
+                (Document.extra_metadata.is_(None))
+                | (Document.extra_metadata == "")
+                | (Document.extra_metadata.notlike("%original_filename%"))
+            )
+        )
+    ).all()
     changed = 0
     for doc in documents:
         meta = parse_metadata(doc.extra_metadata)
@@ -114,17 +156,28 @@ async def _jobs_for_running_docs(
     return out
 
 
-async def list_documents(
-    session: AsyncSession,
+_LIST_LOAD = (
+    Document.id,
+    Document.title,
+    Document.pages,
+    Document.block_count,
+    Document.review_score,
+    Document.review_summary,
+    Document.status,
+    Document.series,
+    Document.error,
+    Document.updated_at,
+    Document.created_at,
+)
+
+
+def _document_filters(
     *,
     q: str | None = None,
     status: str | None = None,
     series: str | None = None,
     uncategorized: bool = False,
-    sort: str = "updated_at",
-    limit: int = 20000,
-) -> tuple[list[dict], int]:
-    """Return (items, total) where total is the filtered count before limit."""
+) -> list:
     filters = []
     if status:
         filters.append(Document.status == status)
@@ -135,27 +188,68 @@ async def list_documents(
     if q:
         like = f"%{q}%"
         filters.append(Document.title.like(like))
+    return filters
 
+
+def _apply_document_sort(stmt, sort: str):
+    if sort == "title":
+        return stmt.order_by(Document.title)
+    if sort == "created_at":
+        return stmt.order_by(Document.created_at.desc())
+    return stmt.order_by(Document.updated_at.desc())
+
+
+async def list_documents(
+    session: AsyncSession,
+    *,
+    q: str | None = None,
+    status: str | None = None,
+    series: str | None = None,
+    uncategorized: bool = False,
+    sort: str = "updated_at",
+    limit: int = 20000,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """Return (items, total) where total is the filtered count before limit."""
+    filters = _document_filters(
+        q=q, status=status, series=series, uncategorized=uncategorized
+    )
     count_stmt = select(func.count()).select_from(Document)
-    stmt = select(Document)
+    stmt = select(Document).options(load_only(*_LIST_LOAD))
     for clause in filters:
         count_stmt = count_stmt.where(clause)
         stmt = stmt.where(clause)
 
     total = int((await session.scalar(count_stmt)) or 0)
 
-    if sort == "title":
-        stmt = stmt.order_by(Document.title)
-    elif sort == "created_at":
-        stmt = stmt.order_by(Document.created_at.desc())
-    else:
-        stmt = stmt.order_by(Document.updated_at.desc())
-    stmt = stmt.limit(max(1, int(limit)))
+    stmt = _apply_document_sort(stmt, sort)
+    stmt = stmt.offset(max(0, int(offset))).limit(max(1, int(limit)))
     rows = (await session.scalars(stmt)).all()
     running_ids = [d.id for d in rows if d.status == "ocr_running"]
     jobs_map = await _jobs_for_running_docs(session, running_ids)
-    items = [document_to_dict(d, job=jobs_map.get(d.id)) for d in rows]
+    items = [document_to_list_dict(d, job=jobs_map.get(d.id)) for d in rows]
     return items, total
+
+
+async def list_document_ids(
+    session: AsyncSession,
+    *,
+    q: str | None = None,
+    status: str | None = None,
+    series: str | None = None,
+    uncategorized: bool = False,
+    sort: str = "updated_at",
+) -> tuple[list[str], int]:
+    """IDs matching the current library filter, for bulk select without loading rows."""
+    filters = _document_filters(
+        q=q, status=status, series=series, uncategorized=uncategorized
+    )
+    stmt = select(Document.id)
+    for clause in filters:
+        stmt = stmt.where(clause)
+    stmt = _apply_document_sort(stmt, sort)
+    ids = [str(x) for x in (await session.scalars(stmt)).all()]
+    return ids, len(ids)
 
 
 async def get_document(session: AsyncSession, doc_id: str) -> Document | None:

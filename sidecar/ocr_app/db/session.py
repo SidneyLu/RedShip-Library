@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from ocr_app.config import settings
@@ -31,6 +31,10 @@ def _configure_sqlite(dbapi_conn, _connection_record) -> None:
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout=60000")
     cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA temp_store=MEMORY")
+    # ~128 MiB page cache + mmap so a multi-GB library.db does not cold-scan on every list.
+    cursor.execute("PRAGMA cache_size=-131072")
+    cursor.execute("PRAGMA mmap_size=268435456")
     cursor.close()
 
 
@@ -77,6 +81,15 @@ async def create_tables() -> None:
     assert _engine is not None
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_documents_updated_at ON documents (updated_at)")
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_documents_series_updated "
+                "ON documents (series, updated_at)"
+            )
+        )
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:

@@ -40,7 +40,11 @@ class Document(Base):
 
     jobs: Mapped[list["OcrJob"]] = relationship(back_populates="document", cascade="all, delete-orphan")
 
-    __table_args__ = (Index("ix_documents_title", "title"),)
+    __table_args__ = (
+        Index("ix_documents_title", "title"),
+        Index("ix_documents_updated_at", "updated_at"),
+        Index("ix_documents_series_updated", "series", "updated_at"),
+    )
 
 
 class OcrJob(Base):

@@ -101,14 +101,35 @@ export async function listDocuments(params?: {
   status?: string;
   series?: string;
   uncategorized?: boolean;
+  limit?: number;
+  offset?: number;
+  sort?: string;
 }): Promise<{ items: DocumentItem[]; total: number }> {
   const qs = new URLSearchParams();
   if (params?.q) qs.set("q", params.q);
   if (params?.status) qs.set("status", params.status);
   if (params?.series) qs.set("series", params.series);
   if (params?.uncategorized) qs.set("uncategorized", "true");
+  if (params?.limit != null) qs.set("limit", String(params.limit));
+  if (params?.offset != null) qs.set("offset", String(params.offset));
+  if (params?.sort) qs.set("sort", params.sort);
   const q = qs.toString();
   return api(`/library/documents${q ? `?${q}` : ""}`);
+}
+
+export async function listDocumentIds(params?: {
+  q?: string;
+  status?: string;
+  series?: string;
+  uncategorized?: boolean;
+}): Promise<{ ids: string[]; total: number }> {
+  const qs = new URLSearchParams();
+  if (params?.q) qs.set("q", params.q);
+  if (params?.status) qs.set("status", params.status);
+  if (params?.series) qs.set("series", params.series);
+  if (params?.uncategorized) qs.set("uncategorized", "true");
+  const q = qs.toString();
+  return api(`/library/documents/ids${q ? `?${q}` : ""}`);
 }
 
 export async function updateDocument(
